@@ -1,42 +1,37 @@
 #!/usr/bin/env python3
 """
-asa_set_dt_ip.py — change the IP address on the DT interface (Ethernet1/9)
-and keep the matching 'object network DTIP' subnet in step with it.
+asa_set_dt_ip.py — DT interface address, network object, and the SIEM / AGENT /
+PAT NAT + ACL entries on a Cisco ASA over the serial console.
 
-Reuses the serial console connection from asa-config-vpn.py (CiscoASA class),
-so the same auth / factory-wizard / enable-mode handling applies. That file must
-sit in the same directory as this one.
+Everything is a command-line argument except the enable password, which stays
+in the environment: ASA_SECRET (or ASA_KNOWN_SECRET, default Cisco123).
 
-Environment variables:
-  ASA_DT_IP         (required)  New IP address,        e.g. 192.168.20.30
-  ASA_DT_NETMASK    (optional)  Dotted-decimal mask,   default 255.255.255.0
-  ASA_DT_INTERFACE  (optional)  Hardware interface,    default Ethernet1/9
-  ASA_DT_NAMEIF     (optional)  Expected nameif,       default DTOUT
-  ASA_DT_OBJECT     (optional)  Network object name,   default DTIP
+  --ip ADDR              Required. New IP address for the DT interface.
+  --netmask MASK         Default 255.255.255.0
+  --interface NAME       Default Ethernet1/9
+  --nameif NAME          Default DTOUT
+  --object NAME          Default DTIP — holds the DT subnet
+  --sensor-nameif NAME   Default SENSORPORT
+  --acl NAME             Default DTOUT_IN
 
-  ASA_SIEM          (optional)  1 = configure SIEM-VM NAT + ACE, 0 = delete
-  ASA_AGENT         (optional)  1 = configure AGENT-VM NAT + ACE, 0 = delete
-  ASA_PAT           (optional)  1 = configure OVN-EGRESS PAT, 0 = delete it
-                                Unset = leave that feature untouched.
-  ASA_SIEM_HOST     (optional)  Host IP, only needed when creating SIEM-VM
-  ASA_AGENT_HOST    (optional)  Host IP, only needed when creating AGENT-VM
-  ASA_SENSOR_NAMEIF (optional)  Source nameif,         default SENSORPORT
-  ASA_DT_ACL        (optional)  Inbound ACL name,      default DTOUT_IN
-  ASA_PAT_GROUP     (optional)  PAT source group,      default OVN-EGRESS
-  ASA_KNOWN_SECRET  (optional)  Enable password,       default Cisco123
-  ASA_SECRET        (optional)  Overrides ASA_KNOWN_SECRET for auth
+  --siem  enable|disable   SIEM-VM  NAT + ACL entry
+  --agent enable|disable   AGENT-VM NAT + ACL entry
+  --pat   enable|disable   Global after-auto PAT rule
+  --siem-host / --agent-host   Host IP, only needed when creating the object
 
-The object subnet is derived from ASA_DT_IP + ASA_DT_NETMASK — e.g.
-192.168.20.45/255.255.255.0 gives 'subnet 192.168.20.0 255.255.255.0'.
+Omitting a feature flag leaves that feature exactly as it is on the device.
+
+Admin state: once features have been applied, the interface is shut when none
+of the three are enabled and brought up when at least one is. The decision is
+made from the device's running config, not just the flags given, so features
+you did not name are still counted. Suppress with --no-auto-shutdown. A run
+with no feature flags at all never touches the admin state.
 
 Usage:
-  export ASA_DT_IP=192.168.20.45
-  export ASA_DT_NETMASK=255.255.255.0
-  ./asa_set_dt_ip.py                 # apply both and save
-  ./asa_set_dt_ip.py --dry-run       # print commands only, no serial connection
-  ./asa_set_dt_ip.py --no-save       # apply but do not 'write memory'
-  ./asa_set_dt_ip.py --skip-object   # interface only, leave the object alone
-  ./asa_set_dt_ip.py --object-only   # object only, leave the interface alone
+  export ASA_SECRET=...
+  ./asa_set_dt_ip.py --ip 192.168.20.45 --siem enable --agent enable --pat enable
+  ./asa_set_dt_ip.py --ip 192.168.20.45 --siem disable --agent disable --pat disable
+  ./asa_set_dt_ip.py --ip 192.168.20.45 --dry-run
 """
 
 import argparse
@@ -97,20 +92,24 @@ DEFAULT_PAT_GROUP = 'OVN-EGRESS'
 # 1 = configure, 0 = delete, unset = leave exactly as it is.
 NAT_OBJECTS = [
     {
-        'env': 'ASA_SIEM',
+        'key': 'siem',
+        'flag': '--siem',
+        'host_key': 'siem_host',
+        'host_flag': '--siem-host',
         'object': 'SIEM-VM',
         'protocol': 'tcp',
         'real_port': '9999',
         'mapped_port': '9997',
-        'host_env': 'ASA_SIEM_HOST',
     },
     {
-        'env': 'ASA_AGENT',
+        'key': 'agent',
+        'flag': '--agent',
+        'host_key': 'agent_host',
+        'host_flag': '--agent-host',
         'object': 'AGENT-VM',
         'protocol': 'tcp',
         'real_port': '8000',
         'mapped_port': '8000',
-        'host_env': 'ASA_AGENT_HOST',
     },
 ]
 
@@ -199,91 +198,135 @@ def restore_pager(asa):
 
 
 
-def parse_toggle(name):
-    """
-    Read a 1/0 style switch. Returns True, False, or None when the variable is
-    not set at all — unset means 'leave this feature alone', which is different
-    from 0 ('delete it').
-    """
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == '':
-        return None
-    value = raw.strip().lower()
-    if value in ('1', 'true', 'yes', 'on', 'enable', 'enabled'):
-        return True
-    if value in ('0', 'false', 'no', 'off', 'disable', 'disabled'):
-        return False
-    error(f"{name} must be 1 or 0 (got {raw!r})")
-    sys.exit(1)
+def parse_args(argv=None):
+    """Everything except the enable password comes from the command line."""
+    parser = argparse.ArgumentParser(
+        description="Change the IP address on the ASA DT interface, keep the "
+                    "matching network object in step, and enable or disable the "
+                    "SIEM / AGENT / PAT NAT and ACL entries.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument("--ip", required=True, metavar="ADDR",
+                        help="New IP address for the DT interface")
+    parser.add_argument("--netmask", default=DEFAULT_NETMASK, metavar="MASK",
+                        help="Dotted-decimal netmask")
+    parser.add_argument("--interface", default=DEFAULT_INTERFACE,
+                        help="Hardware interface to change")
+    parser.add_argument("--nameif", default=DEFAULT_NAMEIF,
+                        help="Expected nameif on that interface")
+    parser.add_argument("--object", dest="object_name", default=DEFAULT_OBJECT,
+                        help="Network object holding the DT subnet")
+    parser.add_argument("--sensor-nameif", default=DEFAULT_SENSOR_NAMEIF,
+                        help="Source nameif for the NAT rules")
+    parser.add_argument("--acl", default=DEFAULT_ACL,
+                        help="Inbound ACL that carries the SIEM/AGENT entries")
+
+    toggle = ('enable', 'disable')
+    features = parser.add_argument_group(
+        'features',
+        'Omit a feature to leave it exactly as it is on the device.')
+    features.add_argument("--siem", choices=toggle,
+                          help="SIEM-VM NAT + ACL entry")
+    features.add_argument("--agent", choices=toggle,
+                          help="AGENT-VM NAT + ACL entry")
+    features.add_argument("--pat", choices=toggle,
+                          help="Global after-auto PAT rule")
+    features.add_argument("--siem-host", metavar="ADDR",
+                          help="Host IP, only needed when creating SIEM-VM")
+    features.add_argument("--agent-host", metavar="ADDR",
+                          help="Host IP, only needed when creating AGENT-VM")
+    features.add_argument("--pat-group", default=DEFAULT_PAT_GROUP,
+                          help="Source object-group for the PAT rule")
+    features.add_argument("--pat-description", metavar="TEXT",
+                          help="Override the PAT rule description")
+
+    parser.add_argument("--no-auto-shutdown", action="store_true",
+                        help="Do not shut/no-shut the interface based on whether "
+                             "any feature is left enabled")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print the commands without connecting to the device")
+    parser.add_argument("--no-save", action="store_true",
+                        help="Apply changes but do not write to startup-config")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Echo raw console output")
+
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--skip-object", action="store_true",
+                       help="Change the interface only, leave the network object alone")
+    scope.add_argument("--object-only", action="store_true",
+                       help="Change the network object only, leave the interface alone")
+
+    return parser.parse_args(argv)
 
 
-def read_env():
-    """Collect and validate the inputs from the environment."""
-    ip_address = os.getenv('ASA_DT_IP')
-    netmask = os.getenv('ASA_DT_NETMASK', DEFAULT_NETMASK)
-    interface = os.getenv('ASA_DT_INTERFACE', DEFAULT_INTERFACE)
-    nameif = os.getenv('ASA_DT_NAMEIF', DEFAULT_NAMEIF)
-    object_name = os.getenv('ASA_DT_OBJECT', DEFAULT_OBJECT)
-    sensor_nameif = os.getenv('ASA_SENSOR_NAMEIF', DEFAULT_SENSOR_NAMEIF)
-    acl_name = os.getenv('ASA_DT_ACL', DEFAULT_ACL)
-    pat_group = os.getenv('ASA_PAT_GROUP', DEFAULT_PAT_GROUP)
-
-    if not ip_address:
-        error("ASA_DT_IP is not set. Export it before running, e.g.\n"
-              "         export ASA_DT_IP=192.168.20.45")
-        sys.exit(1)
-
+def build_settings(args):
+    """Validate the arguments and derive everything that follows from them."""
     try:
-        addr = ipaddress.IPv4Address(ip_address)
+        addr = ipaddress.IPv4Address(args.ip)
     except ipaddress.AddressValueError:
-        error(f"ASA_DT_IP is not a valid IPv4 address: {ip_address}")
+        error(f"--ip is not a valid IPv4 address: {args.ip}")
         sys.exit(1)
 
     try:
-        network = ipaddress.IPv4Network(f"{ip_address}/{netmask}", strict=False)
+        network = ipaddress.IPv4Network(f"{args.ip}/{args.netmask}", strict=False)
     except (ipaddress.AddressValueError, ipaddress.NetmaskValueError, ValueError):
-        error(f"ASA_DT_NETMASK is not a valid dotted-decimal mask: {netmask}")
+        error(f"--netmask is not a valid dotted-decimal mask: {args.netmask}")
         sys.exit(1)
 
     # An ASA will accept these and then quietly black-hole the interface.
     if network.prefixlen < 31:
         if addr == network.network_address:
-            error(f"{ip_address} is the network address of {network} — "
+            error(f"{args.ip} is the network address of {network} — "
                   f"pick a host address.")
             sys.exit(1)
         if addr == network.broadcast_address:
-            error(f"{ip_address} is the broadcast address of {network} — "
+            error(f"{args.ip} is the broadcast address of {network} — "
                   f"pick a host address.")
             sys.exit(1)
 
-    if not re.match(r'^[A-Za-z]+\d+/\d+$', interface):
-        error(f"ASA_DT_INTERFACE does not look like a hardware interface: {interface}")
+    if not re.match(r'^[A-Za-z]+\d+/\d+$', args.interface):
+        error(f"--interface does not look like a hardware interface: {args.interface}")
         sys.exit(1)
 
-    if not re.match(r'^[A-Za-z0-9_.\-]{1,64}$', object_name):
-        error(f"ASA_DT_OBJECT is not a valid object name: {object_name}")
+    if not re.match(r'^[A-Za-z0-9_.\-]{1,64}$', args.object_name):
+        error(f"--object is not a valid object name: {args.object_name}")
         sys.exit(1)
+
+    for label, host in (('--siem-host', args.siem_host),
+                        ('--agent-host', args.agent_host)):
+        if host:
+            try:
+                ipaddress.IPv4Address(host)
+            except ipaddress.AddressValueError:
+                error(f"{label} is not a valid IPv4 address: {host}")
+                sys.exit(1)
+
+    def want(value):
+        """'enable' -> True, 'disable' -> False, omitted -> None (leave alone)."""
+        return None if value is None else (value == 'enable')
 
     return {
-        'ip_address': ip_address,
-        'netmask': netmask,
-        'interface': interface,
-        'nameif': nameif,
+        'ip_address': args.ip,
+        'netmask': args.netmask,
+        'interface': args.interface,
+        'nameif': args.nameif,
         'network': str(network),
-        'object_name': object_name,
+        'object_name': args.object_name,
         # The object holds the SUBNET the DT address sits in, not the host
         # address, so it is derived from the network the new IP falls in.
         'subnet': str(network.network_address),
         'subnet_mask': str(network.netmask),
-        'sensor_nameif': sensor_nameif,
-        'acl_name': acl_name,
-        'pat_group': pat_group,
-        'pat_description': os.getenv(
-            'ASA_PAT_DESCRIPTION',
-            f"PAT all over egress behind {ip_address}"),
-        'siem': parse_toggle('ASA_SIEM'),
-        'agent': parse_toggle('ASA_AGENT'),
-        'pat': parse_toggle('ASA_PAT'),
+        'sensor_nameif': args.sensor_nameif,
+        'acl_name': args.acl,
+        'pat_group': args.pat_group,
+        'pat_description': (args.pat_description
+                            or f"PAT all over egress behind {args.ip}"),
+        'siem': want(args.siem),
+        'agent': want(args.agent),
+        'pat': want(args.pat),
+        'siem_host': args.siem_host,
+        'agent_host': args.agent_host,
     }
 
 
@@ -512,7 +555,7 @@ def build_nat_object_commands(settings, spec, enable, existing=None):
     """
     if enable:
         commands = [f"object network {spec['object']}"]
-        host = os.getenv(spec['host_env'])
+        host = settings.get(spec['host_key'])
         if host:
             commands.append(f" host {host}")
         commands.append(f" {nat_line(settings, spec)}")
@@ -592,14 +635,14 @@ def apply_nat_object(asa, settings, spec, enable):
         before = show_object(asa, name)
         if not before:
             error(f"object network {name} was not found in the running config. "
-                  f"Create it first, or set {spec['host_env']} to its host IP "
-                  f"and this script will create it.")
+                  f"Create it first, or pass {spec['host_flag']} with its host "
+                  f"IP and this script will create it.")
             return 'failed'
 
-        if not object_body_type(before) and not os.getenv(spec['host_env']):
+        if not object_body_type(before) and not settings.get(spec['host_key']):
             error(f"object network {name} exists but has no host/subnet. The ASA "
-                  f"rejects a NAT line on an object with no address — set "
-                  f"{spec['host_env']} to its host IP.")
+                  f"rejects a NAT line on an object with no address — pass "
+                  f"{spec['host_flag']} with its host IP.")
             return 'failed'
 
         if existing:
@@ -777,34 +820,91 @@ def apply_pat(asa, settings, enable):
 
 
 
+def feature_state_on_device(asa, settings):
+    """
+    Read back which of the three features are actually present on the device.
+
+    This is deliberately read from the running config rather than inferred from
+    the flags: a run that only passes --siem still needs to know whether AGENT
+    and PAT are live before deciding to shut the interface.
+    """
+    nat_config = show_nat(asa)
+    state = {}
+    for spec in NAT_OBJECTS:
+        state[spec['key']] = object_nat_rule(asa, spec['object'], nat_config) is not None
+    state['pat'] = find_pat_rule(nat_config, settings) is not None
+    return state
+
+
+def interface_is_shutdown(config_block):
+    """True if the interface block carries a 'shutdown' line."""
+    return bool(re.search(r'^\s*shutdown\s*$', config_block or '', re.MULTILINE))
+
+
+def apply_interface_state(asa, settings):
+    """
+    Shut the DT interface when no feature is left enabled, bring it up when at
+    least one is. Returns 'changed', 'unchanged' or 'failed'.
+
+    With nothing translated or permitted through it, an up interface is just
+    exposed surface — so the default posture is down.
+    """
+    interface = settings['interface']
+    state = feature_state_on_device(asa, settings)
+    live = [name for name, present in state.items() if present]
+
+    before = show_interface(asa, interface)
+    if not before:
+        error(f"Could not read {interface} to set its admin state.")
+        return 'failed'
+
+    currently_down = interface_is_shutdown(before)
+    should_be_down = not live
+
+    if should_be_down == currently_down:
+        posture = 'shut' if currently_down else 'up'
+        info(f"{interface} is already {posture} "
+             f"({'no features enabled' if should_be_down else ', '.join(sorted(live))}).")
+        return 'unchanged'
+
+    if should_be_down:
+        warn(f"No features left enabled — shutting {interface}. Anything "
+             f"reaching the DT network through it will stop.")
+        commands = [f"interface {interface}", " shutdown"]
+    else:
+        info(f"Features enabled ({', '.join(sorted(live))}) — bringing "
+             f"{interface} up.")
+        commands = [f"interface {interface}", " no shutdown"]
+
+    output = asa.send_config_commands(
+        commands, description=f"{'Shut' if should_be_down else 'Enable'} {interface}")
+    if output is None:
+        error(f"Failed to set admin state on {interface}")
+        return 'failed'
+
+    now_down = interface_is_shutdown(show_interface(asa, interface))
+    if now_down == should_be_down:
+        success(f"{interface} is now {'shut down' if now_down else 'up'}.")
+        return 'changed'
+
+    error(f"{interface} admin state verification failed.")
+    return 'failed'
+
+
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Change the IP address on the ASA DT interface (Ethernet1/9) "
-                    "and keep the matching network object subnet in step."
-    )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print the commands without connecting to the device")
-    parser.add_argument("--no-save", action="store_true",
-                        help="Apply the change but do not write to startup-config")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Echo raw console output")
+    args = parse_args()
+    settings = build_settings(args)
 
-    scope = parser.add_mutually_exclusive_group()
-    scope.add_argument("--skip-object", action="store_true",
-                       help="Change the interface only, leave the network object alone")
-    scope.add_argument("--object-only", action="store_true",
-                       help="Change the network object only, leave the interface alone")
-
-    args = parser.parse_args()
-
-    settings = read_env()
     do_interface = not args.object_only
     do_object = not args.skip_object
-    # Each NAT feature runs only when its variable is set. Unset means leave it.
-    nat_specs = [(spec, settings[spec['env'].replace('ASA_', '').lower()])
-                 for spec in NAT_OBJECTS]
-    nat_specs = [(spec, want) for spec, want in nat_specs if want is not None]
+    # A feature runs only when its flag was given; omitted means leave it alone.
+    nat_specs = [(spec, settings[spec['key']]) for spec in NAT_OBJECTS
+                 if settings[spec['key']] is not None]
     do_pat = settings['pat'] is not None
+    # Only touch the admin state when the run actually decided something about
+    # the features — a bare address change should not shut the port.
+    do_admin_state = (bool(nat_specs) or do_pat) and not args.no_auto_shutdown
 
     print(f"\n{Colors.BOLD}DT address change{Colors.RESET}")
     if do_interface:
@@ -816,11 +916,14 @@ def main():
         print(f"  Object    : {settings['object_name']}")
         print(f"  Subnet    : {settings['subnet']} {settings['subnet_mask']}")
     for spec, want in nat_specs:
-        print(f"  {spec['env']:<10}: {'configure' if want else 'DELETE'} "
+        print(f"  {spec['flag']:<8}  : {'enable' if want else 'DISABLE'} "
               f"{spec['object']} (NAT + {settings['acl_name']} ACE)")
     if do_pat:
-        print(f"  ASA_PAT   : {'configure' if settings['pat'] else 'DELETE'} "
+        print(f"  --pat     : {'enable' if settings['pat'] else 'DISABLE'} "
               f"{settings['pat_group']} PAT")
+    if do_admin_state:
+        print(f"  Admin     : {settings['interface']} will be shut if no feature "
+              f"is left enabled")
 
     if args.dry_run:
         print(f"\n{Colors.CYAN}{Colors.BOLD}--- DRY RUN MODE ---{Colors.RESET}")
@@ -848,6 +951,18 @@ def main():
             for cmd in build_pat_commands(settings, settings['pat']):
                 print(f"  {cmd}")
             print("  exit")
+        if do_admin_state:
+            enabled = [s['object'] for s in NAT_OBJECTS if settings[s['key']]]
+            if settings['pat']:
+                enabled.append('PAT')
+            print("  configure terminal")
+            print(f"  interface {settings['interface']}")
+            print(f"   {'no shutdown' if enabled else 'shutdown'}")
+            print("  exit")
+            if not enabled:
+                print(f"  {Colors.YELLOW}(flags given all disable; on the device "
+                      f"the decision also accounts for features not named "
+                      f"here){Colors.RESET}")
         if not args.no_save:
             print("  write memory")
         print("-" * 40)
@@ -920,6 +1035,16 @@ def main():
                 if 'changed' in outcomes:
                     warn("Earlier changes are in the running config but the PAT "
                          "stage failed — review before saving.")
+                return 1
+            outcomes.append(result)
+
+        if do_admin_state:
+            if not enter_enable(asa, auth_secret):
+                return 1
+            result = apply_interface_state(asa, settings)
+            if result == 'failed':
+                warn("Feature changes are in the running config but the "
+                     f"{settings['interface']} admin state was not set.")
                 return 1
             outcomes.append(result)
 
