@@ -316,9 +316,58 @@ def current_ip(config_block):
     return (match.group(1), match.group(2)) if match else None
 
 
+def object_block(config_text, object_name):
+    """
+    Slice one object's block out of a running-config dump, including anything
+    indented under it — the 'host' line AND the nested 'nat (...)' line.
+
+    Object NAT lives inside the object block, not in the global NAT section, so
+    this is what has to be parsed to see a SIEM-VM / AGENT-VM NAT rule.
+    """
+    header = re.compile(rf'^object network {re.escape(object_name)}\s*$')
+    captured = []
+    capturing = False
+
+    for line in (config_text or '').splitlines():
+        if not capturing:
+            if header.match(line.strip()) and not line[:1].isspace():
+                capturing = True
+                captured.append(line.strip())
+            continue
+        # Indented lines belong to this object; the first unindented line ends it.
+        if line[:1].isspace():
+            captured.append(line.rstrip())
+        elif line.strip() == '':
+            continue
+        else:
+            break
+
+    return '\n'.join(captured)
+
+
 def show_object(asa, object_name):
-    """Return the running-config block for the network object."""
-    return asa.send_command(f'show running-config object id {object_name}', timeout=10)
+    """
+    Return the running-config block for one network object.
+
+    'show running-config object id NAME' is not accepted on every ASA build and
+    returns nothing useful on some, so pull the whole object-network section and
+    slice the block out of it. Falls back to the per-object form if the section
+    dump comes back empty.
+    """
+    output = asa.send_command('show running-config object network', timeout=20)
+    block = object_block(output, object_name)
+    if block:
+        return block
+
+    output = asa.send_command(f'show running-config object id {object_name}',
+                              timeout=10)
+    block = object_block(output, object_name)
+    if block:
+        return block
+
+    # Nothing found. Hand back the raw reply so callers can report what the
+    # device actually said rather than guessing.
+    return ''
 
 
 def current_subnet(config_block):
@@ -506,10 +555,16 @@ def apply_nat_object(asa, settings, spec, enable):
 
         # Object NAT needs an address on the object; the ASA rejects the nat
         # line otherwise. Only the host env var can supply one we don't have.
+        if not before:
+            error(f"object network {name} was not found in the running config. "
+                  f"Create it first, or set {spec['host_env']} to its host IP "
+                  f"and this script will create it.")
+            return 'failed'
+
         if not object_body_type(before) and not os.getenv(spec['host_env']):
-            error(f"object network {name} does not exist or has no address. "
-                  f"Set {spec['host_env']} to its host IP, or create the object "
-                  f"first — the ASA will reject the NAT line without one.")
+            error(f"object network {name} exists but has no host/subnet. The ASA "
+                  f"rejects a NAT line on an object with no address — set "
+                  f"{spec['host_env']} to its host IP.")
             return 'failed'
 
         if existing:
