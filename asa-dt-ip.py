@@ -497,8 +497,15 @@ def pat_line(settings, with_description=True):
     return line
 
 
-def build_nat_object_commands(settings, spec, enable):
-    """Config commands to add or remove one object NAT rule."""
+def build_nat_object_commands(settings, spec, enable, existing=None):
+    """
+    Config commands to add or remove one object NAT rule.
+
+    On removal, `existing` is the rule as the device actually has it. Removing
+    by the device's own wording matters when the rule on the box differs from
+    the one we would build (different ports, say) — the ASA matches the whole
+    line, so a near-miss removes nothing.
+    """
     if enable:
         commands = [f"object network {spec['object']}"]
         host = os.getenv(spec['host_env'])
@@ -508,7 +515,10 @@ def build_nat_object_commands(settings, spec, enable):
         return commands
     # Remove the NAT only. The object itself is left in place because ACLs and
     # other rules may still reference it; deleting it would break them.
-    return [f"object network {spec['object']}", " no nat"]
+    # 'no nat' on its own is an incomplete command — the whole rule has to be
+    # repeated after the 'no'.
+    return [f"object network {spec['object']}",
+            f" no {existing or nat_line(settings, spec)}"]
 
 
 def build_pat_commands(settings, enable):
@@ -599,7 +609,7 @@ def apply_nat_object(asa, settings, spec, enable):
         info(f"{name}: removing {existing}")
 
     output = asa.send_config_commands(
-        build_nat_object_commands(settings, spec, enable),
+        build_nat_object_commands(settings, spec, enable, existing),
         description=f"{'Configure' if enable else 'Delete'} NAT on {name}"
     )
     if output is None:
