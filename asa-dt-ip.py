@@ -14,13 +14,14 @@ Environment variables:
   ASA_DT_NAMEIF     (optional)  Expected nameif,       default DTOUT
   ASA_DT_OBJECT     (optional)  Network object name,   default DTIP
 
-  ASA_SIEM          (optional)  1 = configure SIEM-VM NAT, 0 = delete it
-  ASA_AGENT         (optional)  1 = configure AGENT-VM NAT, 0 = delete it
+  ASA_SIEM          (optional)  1 = configure SIEM-VM NAT + ACE, 0 = delete
+  ASA_AGENT         (optional)  1 = configure AGENT-VM NAT + ACE, 0 = delete
   ASA_PAT           (optional)  1 = configure OVN-EGRESS PAT, 0 = delete it
                                 Unset = leave that feature untouched.
   ASA_SIEM_HOST     (optional)  Host IP, only needed when creating SIEM-VM
   ASA_AGENT_HOST    (optional)  Host IP, only needed when creating AGENT-VM
   ASA_SENSOR_NAMEIF (optional)  Source nameif,         default SENSORPORT
+  ASA_DT_ACL        (optional)  Inbound ACL name,      default DTOUT_IN
   ASA_PAT_GROUP     (optional)  PAT source group,      default OVN-EGRESS
   ASA_KNOWN_SECRET  (optional)  Enable password,       default Cisco123
   ASA_SECRET        (optional)  Overrides ASA_KNOWN_SECRET for auth
@@ -89,6 +90,7 @@ DEFAULT_NAMEIF = 'DTOUT'
 DEFAULT_NETMASK = '255.255.255.0'
 DEFAULT_OBJECT = 'DTIP'
 DEFAULT_SENSOR_NAMEIF = 'SENSORPORT'
+DEFAULT_ACL = 'DTOUT_IN'
 DEFAULT_PAT_GROUP = 'OVN-EGRESS'
 
 # The three optional NAT features, driven by ASA_SIEM / ASA_AGENT / ASA_PAT.
@@ -223,6 +225,7 @@ def read_env():
     nameif = os.getenv('ASA_DT_NAMEIF', DEFAULT_NAMEIF)
     object_name = os.getenv('ASA_DT_OBJECT', DEFAULT_OBJECT)
     sensor_nameif = os.getenv('ASA_SENSOR_NAMEIF', DEFAULT_SENSOR_NAMEIF)
+    acl_name = os.getenv('ASA_DT_ACL', DEFAULT_ACL)
     pat_group = os.getenv('ASA_PAT_GROUP', DEFAULT_PAT_GROUP)
 
     if not ip_address:
@@ -273,6 +276,7 @@ def read_env():
         'subnet': str(network.network_address),
         'subnet_mask': str(network.netmask),
         'sensor_nameif': sensor_nameif,
+        'acl_name': acl_name,
         'pat_group': pat_group,
         'pat_description': os.getenv(
             'ASA_PAT_DESCRIPTION',
@@ -628,6 +632,103 @@ def apply_nat_object(asa, settings, spec, enable):
     return 'failed'
 
 
+def acl_line(settings, spec):
+    """
+    The ACE that lets traffic reach the object, e.g.
+    'access-list DTOUT_IN extended permit tcp any object SIEM-VM eq 9999 log'.
+
+    The port is the REAL port, not the mapped one — post-8.3 ASA matches ACLs
+    against the untranslated address and port.
+    """
+    return (f"access-list {settings['acl_name']} extended permit "
+            f"{spec['protocol']} any object {spec['object']} "
+            f"eq {spec['real_port']} log")
+
+
+def show_acl(asa, acl_name):
+    """Return the running config for one access-list."""
+    return asa.send_command(f'show running-config access-list {acl_name}', timeout=20)
+
+
+def normalise_ace(line):
+    """Drop any 'line N' sequence number the device prints back."""
+    return re.sub(r'^(access-list \S+) line \d+ ', r'\1 ', line.strip())
+
+
+def find_acl_entry(acl_config, settings, spec):
+    """
+    Return the existing ACE referencing this object, as the device words it,
+    or None. Matching on the object name rather than the whole line means a
+    stale entry with the wrong port is still found — and can then be removed
+    using the device's own wording.
+    """
+    pattern = (rf'^\s*(access-list {re.escape(settings["acl_name"])}\b.*'
+               rf'\bobject {re.escape(spec["object"])}\b.*)$')
+    match = re.search(pattern, acl_config or '', re.MULTILINE)
+    return normalise_ace(match.group(1)) if match else None
+
+
+def build_acl_commands(settings, spec, enable, existing=None):
+    """Config commands to add or remove the ACE for one object."""
+    if enable:
+        return [acl_line(settings, spec)]
+    return [f"no {existing or acl_line(settings, spec)}"]
+
+
+def apply_acl(asa, settings, spec, enable):
+    """
+    Add or remove the ACE for one object. Returns 'changed', 'unchanged'
+    or 'failed'.
+    """
+    acl = settings['acl_name']
+    name = spec['object']
+    config = show_acl(asa, acl)
+    existing = find_acl_entry(config, settings, spec)
+    wanted = acl_line(settings, spec)
+
+    if enable:
+        if existing == wanted:
+            info(f"{acl}: ACE for {name} already correct — skipping.")
+            return 'unchanged'
+        if existing:
+            # Wrong port or options — remove the old one first, or the ASA
+            # keeps both and the stale entry may match first.
+            info(f"{acl}: replacing {existing}")
+            asa.send_config_commands(build_acl_commands(settings, spec, False, existing),
+                                     description=f"Remove stale ACE for {name}")
+        else:
+            info(f"{acl}: adding ACE for {name}")
+            if not config:
+                warn(f"{acl} does not exist yet — this ACE will create it. Make "
+                     f"sure it is applied to the interface with "
+                     f"'access-group {acl} in interface {settings['nameif']}'.")
+    else:
+        if not existing:
+            info(f"{acl}: no ACE for {name} — nothing to delete.")
+            return 'unchanged'
+        info(f"{acl}: removing {existing}")
+
+    output = asa.send_config_commands(
+        build_acl_commands(settings, spec, enable, existing),
+        description=f"{'Configure' if enable else 'Delete'} ACE for {name}"
+    )
+    if output is None:
+        error(f"Failed to send ACL commands for {name}")
+        return 'failed'
+
+    applied = find_acl_entry(show_acl(asa, acl), settings, spec)
+    if enable and applied == wanted:
+        success(f"{acl}: {wanted}")
+        return 'changed'
+    if not enable and not applied:
+        success(f"{acl}: ACE for {name} removed")
+        return 'changed'
+
+    error(f"{acl}: verification failed — device reports {applied!r}")
+    return 'failed'
+
+
+
 def apply_pat(asa, settings, enable):
     """
     Add or remove the global after-auto PAT rule. Returns 'changed',
@@ -716,7 +817,7 @@ def main():
         print(f"  Subnet    : {settings['subnet']} {settings['subnet_mask']}")
     for spec, want in nat_specs:
         print(f"  {spec['env']:<10}: {'configure' if want else 'DELETE'} "
-              f"{spec['object']}")
+              f"{spec['object']} (NAT + {settings['acl_name']} ACE)")
     if do_pat:
         print(f"  ASA_PAT   : {'configure' if settings['pat'] else 'DELETE'} "
               f"{settings['pat_group']} PAT")
@@ -738,6 +839,8 @@ def main():
         for spec, want in nat_specs:
             print("  configure terminal")
             for cmd in build_nat_object_commands(settings, spec, want):
+                print(f"  {cmd}")
+            for cmd in build_acl_commands(settings, spec, want):
                 print(f"  {cmd}")
             print("  exit")
         if do_pat:
@@ -798,6 +901,14 @@ def main():
                 if 'changed' in outcomes:
                     warn("Earlier changes are in the running config but this "
                          "stage failed — review before saving.")
+                return 1
+            outcomes.append(result)
+
+            result = apply_acl(asa, settings, spec, want)
+            if result == 'failed':
+                warn(f"The NAT for {spec['object']} is in place but its "
+                     f"{settings['acl_name']} entry is not — traffic will be "
+                     f"translated and then dropped. Fix before saving.")
                 return 1
             outcomes.append(result)
 
