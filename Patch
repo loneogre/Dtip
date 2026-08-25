@@ -1,0 +1,331 @@
+# =============================================================================
+# PATCH for asa-config-vpn.py — console-timeout / '>' prompt handling
+#
+# Three edits, all inside class CiscoASA:
+#
+#   EDIT 1  Add the expect-patterns at the end of __init__()
+#           (right after the existing self.re_error = ... block)
+#
+#   EDIT 2  Add the four new helper methods
+#           (paste anywhere in the class, e.g. just above _handle_serial_prompts)
+#
+#   EDIT 3  Replace _try_serial_connection() and _serial_enter_enable_mode()
+#           with the versions below
+#
+# Nothing else in the file changes. _handle_factory_password_setup(),
+# _sync_password() and _read_password_response() are left alone and still used.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# EDIT 1 — append to __init__(), after the self.re_error = re.compile(...) block
+# -----------------------------------------------------------------------------
+
+        # Expect-patterns for prompt-aware reads. The old code stopped a read on
+        # ANY trailing [#>], which meant an unsolicited prompt already sitting in
+        # the buffer (e.g. the one a console-timeout logout emits) was mistaken
+        # for the reply to the command just sent.
+        self.re_enable_prompt = re.compile(r'(?m)^([\w.\-]+)(?:\([\w\-]+\))?#\s*$')
+        self.re_user_prompt = re.compile(r'(?m)^([\w.\-]+)>\s*$')
+        self.re_password = re.compile(r'(?i)password:\s*$')
+        self.re_username = re.compile(r'(?i)username:\s*$')
+        self.re_denied = re.compile(r'(?i)(access denied|invalid password|bad password)')
+        # The factory wizard's prompts also end in 'password:', so they must be
+        # tested BEFORE re_password wherever both are candidates.
+        self.re_wizard = re.compile(r'(?i)(enter\s{1,3}password:|repeat\s+password:)\s*$')
+
+
+# -----------------------------------------------------------------------------
+# EDIT 2 — new helper methods
+# -----------------------------------------------------------------------------
+
+    def _drain(self):
+        """Discard anything left in the receive buffer from a previous command."""
+        try:
+            if self.serial_port and self.serial_port.in_waiting:
+                self.serial_port.reset_input_buffer()
+        except Exception as e:
+            logging.debug(f"Buffer drain failed: {e}")
+
+    def _write_line(self, text):
+        """Raw single-CR write. '\\r\\n' is two line terminators to the ASA and
+        makes it emit two prompts for every one command."""
+        self.serial_port.write((text + '\r').encode('utf-8'))
+        self.serial_port.flush()
+
+    def _read_for(self, patterns, timeout=10):
+        """
+        Read until one of (name, compiled_pattern) matches, in list order.
+        Returns (name, buffer) or (None, buffer) on timeout.
+
+        The buffer starts empty on every call, so a match can only come from
+        output produced after this call began — that is what stops a stale
+        prompt from satisfying the read.
+        """
+        buf = ""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.serial_port.in_waiting:
+                buf += self.serial_port.read(
+                    self.serial_port.in_waiting).decode('utf-8', errors='ignore')
+                if self.verbose:
+                    print(buf[-200:], end='', flush=True)
+                for name, pattern in patterns:
+                    if pattern.search(buf):
+                        return name, buf
+            time.sleep(0.05)
+        return None, buf
+
+    def _restore_terminal(self):
+        """
+        Re-apply pager/width. A console-timeout logout resets terminal settings,
+        so 'terminal pager 0' is undone and the next 'show running-config ...'
+        stalls on <--- More ---> until the reader times out.
+        """
+        for cmd in ('terminal pager 0', 'terminal width 200'):
+            self._drain()
+            self._write_line(cmd)
+            self._read_for([('enable', self.re_enable_prompt)], timeout=5)
+
+    def ensure_enable(self):
+        """
+        Guarantee the session is at a '#' prompt, re-authenticating if a console
+        timeout has dropped it back to '>'. Safe to call repeatedly — call it at
+        the top of each long stage so a mid-run logout is recovered rather than
+        silently swallowing every following command.
+        """
+        if not self.serial_port or not self.serial_port.is_open:
+            return False
+        return self._serial_enter_enable_mode()
+
+
+# -----------------------------------------------------------------------------
+# EDIT 3a — replace _try_serial_connection() with this
+# -----------------------------------------------------------------------------
+
+    def _try_serial_connection(self):
+        """Try to establish serial console connection"""
+        if not SERIAL_AVAILABLE:
+            return False
+
+        port_candidates = []
+
+        try:
+            available_ports = serial.tools.list_ports.comports()
+            for port_info in available_ports:
+                port_candidates.append(port_info.device)
+                logging.info(f"Found serial port: {port_info.device} - {port_info.description}")
+        except Exception as e:
+            logging.debug(f"Port enumeration failed: {e}")
+            pass
+
+        common_paths = [
+            '/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyUSB2', '/dev/ttyUSB3',
+            '/dev/ttyS0', '/dev/ttyS1', '/dev/ttyS2', '/dev/ttyS3',
+            '/dev/ttyACM0', '/dev/ttyACM1',
+            '/dev/tty.usbserial', '/dev/tty.usbmodem',
+            'COM1', 'COM2', 'COM3', 'COM4', 'COM5'
+        ]
+
+        for path in common_paths:
+            if os.path.exists(path) and path not in port_candidates:
+                port_candidates.append(path)
+
+        if not port_candidates:
+            if self.verbose:
+                warn("No serial ports found")
+            return False
+
+        baud_rates = [9600, 115200]
+
+        for port_path in port_candidates:
+            for baud in baud_rates:
+                try:
+                    self.serial_port = serial.Serial(
+                        port=port_path,
+                        baudrate=baud,
+                        bytesize=serial.EIGHTBITS,
+                        parity=serial.PARITY_NONE,
+                        stopbits=serial.STOPBITS_ONE,
+                        timeout=1,
+                        xonxoff=False,
+                        rtscts=False,
+                        dsrdtr=False
+                    )
+
+                    self.serial_port.reset_input_buffer()
+                    self.serial_port.reset_output_buffer()
+
+                    # One CR, not three CR+LFs. Each '\r\n' is TWO line
+                    # terminators to the ASA, so the old loop provoked six
+                    # prompts; five stayed queued and every later read returned
+                    # on a stale one, offsetting the whole session by a command.
+                    self._write_line('')
+                    time.sleep(0.3)
+
+                    response = self._read_serial_output(timeout=2)
+
+                    if response and ('>' in response or '#' in response or
+                                     'ASA' in response or 'ciscoasa' in response or
+                                     'inserthostname' in response or
+                                     'enable password is not set' in response.lower() or
+                                     'enter  password' in response.lower()):
+                        self.connection_type = 'serial'
+
+                        # The old code called this and DISCARDED the result, so
+                        # a failed enable still reported "Connected to ..." and
+                        # every subsequent command was issued at '>' and
+                        # rejected. Treat failure as a failed candidate.
+                        if not self._serial_enter_enable_mode():
+                            warn(f"Found a console on {port_path} @ {baud} but could "
+                                 f"not reach enable mode — trying next candidate.")
+                            logging.warning(f"Enable mode failed on {port_path} @ {baud}")
+                            self.serial_port.close()
+                            self.serial_port = None
+                            continue
+
+                        self._handle_serial_prompts()
+                        self._restore_terminal()
+
+                        self._drain()
+                        self._write_line('')
+                        state, output = self._read_for(
+                            [('enable', self.re_enable_prompt)], timeout=5)
+
+                        if state == 'enable':
+                            prompt_match = self.re_enable_prompt.search(output)
+                            hostname = prompt_match.group(1)
+                            self.prompt = prompt_match.group(0).strip()
+                            success(f"Connected to {hostname} via {port_path}")
+                            logging.info(f"Connected to ASA via serial: {port_path} at {baud} baud")
+                        else:
+                            warn("Enable prompt not confirmed after login — continuing, "
+                                 "but commands may be rejected.")
+
+                        return True
+
+                    self.serial_port.close()
+                    self.serial_port = None
+
+                except serial.SerialException as e:
+                    logging.debug(f"Serial open failed on {port_path} @ {baud}: {e}")
+                    if self.serial_port and self.serial_port.is_open:
+                        self.serial_port.close()
+                    self.serial_port = None
+                except Exception as e:
+                    logging.debug(f"Unexpected error on {port_path} @ {baud}: {e}")
+                    if self.serial_port and self.serial_port.is_open:
+                        self.serial_port.close()
+                    self.serial_port = None
+
+        return False
+
+
+# -----------------------------------------------------------------------------
+# EDIT 3b — replace _serial_enter_enable_mode() with this
+# -----------------------------------------------------------------------------
+
+    def _serial_enter_enable_mode(self):
+        """
+        Bring the session to a '#' prompt.
+
+        Rewritten to read with explicit expect-patterns rather than stopping on
+        any trailing [#>]. With 'console timeout N' configured, the logout emits
+        an unsolicited '>' into the buffer; the old reads returned on that
+        instead of on the real 'Password:' reply, the 'password' test failed,
+        and enable was abandoned without anyone noticing.
+        """
+        KNOWN_SECRET = os.getenv('ASA_KNOWN_SECRET', 'Cisco123')
+        SECRET = os.getenv('ASA_SECRET', KNOWN_SECRET)
+
+        # self.secret stays the highest-priority credential (e.g. the
+        # ASA_WIZARD_SECRET passed in by --revert-to-known).
+        auth_secret = self.secret or SECRET
+
+        self._drain()
+        self._write_line('')
+
+        # re_wizard must precede re_password: 'Enter  password:' matches both.
+        state, buf = self._read_for(
+            [('wizard', self.re_wizard),
+             ('enable', self.re_enable_prompt),
+             ('user', self.re_user_prompt),
+             ('password', self.re_password),
+             ('username', self.re_username)],
+            timeout=6
+        )
+
+        if state == 'wizard':
+            success("Detected active Factory Password Wizard. Synchronizing...")
+            if self._handle_factory_password_setup(auth_secret):
+                self.secret = auth_secret
+                return True
+            return False
+
+        if state == 'enable':
+            logging.info("Already in enable mode.")
+            return True
+
+        if state == 'username':
+            error("Console is behind AAA authentication (Username: prompt). "
+                  "This script handles the enable password only — log in "
+                  "manually or remove 'aaa authentication serial console'.")
+            return False
+
+        if state is None:
+            logging.debug(f"No usable prompt within 6s. Last bytes: {buf.strip()[-80:]!r}")
+            return False
+
+        if state == 'user':
+            hostname_match = self.re_user_prompt.search(buf)
+            hostname = hostname_match.group(1) if hostname_match else ''
+            if hostname.lower().startswith('ciscoasa'):
+                success("Factory-fresh device detected (ciscoasa> prompt).")
+            else:
+                logging.info(f"At user EXEC prompt ({hostname}>) — entering enable mode.")
+
+            self._drain()
+            self._write_line('enable')
+
+            state, buf = self._read_for(
+                [('wizard', self.re_wizard),
+                 ('password', self.re_password),
+                 ('enable', self.re_enable_prompt)],
+                timeout=10
+            )
+
+            if state == 'wizard':
+                success("Factory password wizard triggered by 'enable'. Synchronizing...")
+                if self._handle_factory_password_setup(auth_secret):
+                    self.secret = auth_secret
+                    return True
+                return False
+
+            if state == 'enable':
+                # No enable password set — we are straight in.
+                logging.info("Enable mode entered with no password set.")
+                return True
+
+            if state is None:
+                logging.debug("No 'Password:' prompt after 'enable'.")
+                return False
+
+        # Either we arrived already sitting at a Password: prompt, or 'enable'
+        # produced one.
+        self._write_line(auth_secret)
+
+        state, buf = self._read_for(
+            [('enable', self.re_enable_prompt),
+             ('denied', self.re_denied),
+             ('password', self.re_password),
+             ('user', self.re_user_prompt)],
+            timeout=10
+        )
+
+        if state == 'enable':
+            self.secret = auth_secret
+            logging.info("Logged in with auth_secret.")
+            return True
+
+        logging.debug("Enable authentication rejected — will retry on other candidates.")
+        return False
