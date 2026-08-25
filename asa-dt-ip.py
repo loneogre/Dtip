@@ -526,8 +526,29 @@ def object_nat_line(config_block):
 
 
 def show_nat(asa):
-    """Return the global NAT section of the running config."""
-    return asa.send_command('show running-config nat', timeout=15)
+    """Return the NAT section of the running config."""
+    return asa.send_command('show running-config nat', timeout=20)
+
+
+def object_nat_rule(asa, object_name, nat_config=None):
+    """
+    Return the object (auto) NAT line for one object, or None.
+
+    On this platform object NAT does NOT appear under
+    'show running-config object network' — it is printed by
+    'show running-config nat', beneath its own 'object network NAME' header:
+
+        object network SIEM-VM
+         nat (SENSORPORT,DTOUT) static interface service tcp 9999 9997
+
+    The object-network section is still checked as a fallback, since some
+    builds do print it there.
+    """
+    text = nat_config if nat_config is not None else show_nat(asa)
+    rule = object_nat_line(object_block(text, object_name))
+    if rule:
+        return rule
+    return object_nat_line(show_object(asa, object_name))
 
 
 def find_pat_rule(nat_config, settings):
@@ -544,8 +565,7 @@ def apply_nat_object(asa, settings, spec, enable):
     Add or remove one object NAT rule. Returns 'changed', 'unchanged' or 'failed'.
     """
     name = spec['object']
-    before = show_object(asa, name)
-    existing = object_nat_line(before)
+    existing = object_nat_rule(asa, name)
     wanted = nat_line(settings, spec)
 
     if enable:
@@ -555,6 +575,7 @@ def apply_nat_object(asa, settings, spec, enable):
 
         # Object NAT needs an address on the object; the ASA rejects the nat
         # line otherwise. Only the host env var can supply one we don't have.
+        before = show_object(asa, name)
         if not before:
             error(f"object network {name} was not found in the running config. "
                   f"Create it first, or set {spec['host_env']} to its host IP "
@@ -585,7 +606,7 @@ def apply_nat_object(asa, settings, spec, enable):
         error(f"Failed to send NAT commands for {name}")
         return 'failed'
 
-    applied = object_nat_line(show_object(asa, name))
+    applied = object_nat_rule(asa, name)
     if enable and applied == wanted:
         success(f"{name}: {wanted}")
         return 'changed'
