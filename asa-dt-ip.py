@@ -13,6 +13,15 @@ Environment variables:
   ASA_DT_INTERFACE  (optional)  Hardware interface,    default Ethernet1/9
   ASA_DT_NAMEIF     (optional)  Expected nameif,       default DTOUT
   ASA_DT_OBJECT     (optional)  Network object name,   default DTIP
+
+  ASA_SIEM          (optional)  1 = configure SIEM-VM NAT, 0 = delete it
+  ASA_AGENT         (optional)  1 = configure AGENT-VM NAT, 0 = delete it
+  ASA_PAT           (optional)  1 = configure OVN-EGRESS PAT, 0 = delete it
+                                Unset = leave that feature untouched.
+  ASA_SIEM_HOST     (optional)  Host IP, only needed when creating SIEM-VM
+  ASA_AGENT_HOST    (optional)  Host IP, only needed when creating AGENT-VM
+  ASA_SENSOR_NAMEIF (optional)  Source nameif,         default SENSORPORT
+  ASA_PAT_GROUP     (optional)  PAT source group,      default OVN-EGRESS
   ASA_KNOWN_SECRET  (optional)  Enable password,       default Cisco123
   ASA_SECRET        (optional)  Overrides ASA_KNOWN_SECRET for auth
 
@@ -79,6 +88,29 @@ DEFAULT_INTERFACE = 'Ethernet1/9'
 DEFAULT_NAMEIF = 'DTOUT'
 DEFAULT_NETMASK = '255.255.255.0'
 DEFAULT_OBJECT = 'DTIP'
+DEFAULT_SENSOR_NAMEIF = 'SENSORPORT'
+DEFAULT_PAT_GROUP = 'OVN-EGRESS'
+
+# The three optional NAT features, driven by ASA_SIEM / ASA_AGENT / ASA_PAT.
+# 1 = configure, 0 = delete, unset = leave exactly as it is.
+NAT_OBJECTS = [
+    {
+        'env': 'ASA_SIEM',
+        'object': 'SIEM-VM',
+        'protocol': 'tcp',
+        'real_port': '9999',
+        'mapped_port': '9997',
+        'host_env': 'ASA_SIEM_HOST',
+    },
+    {
+        'env': 'ASA_AGENT',
+        'object': 'AGENT-VM',
+        'protocol': 'tcp',
+        'real_port': '8000',
+        'mapped_port': '8000',
+        'host_env': 'ASA_AGENT_HOST',
+    },
+]
 
 
 def info(msg):
@@ -165,6 +197,24 @@ def restore_pager(asa):
 
 
 
+def parse_toggle(name):
+    """
+    Read a 1/0 style switch. Returns True, False, or None when the variable is
+    not set at all — unset means 'leave this feature alone', which is different
+    from 0 ('delete it').
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == '':
+        return None
+    value = raw.strip().lower()
+    if value in ('1', 'true', 'yes', 'on', 'enable', 'enabled'):
+        return True
+    if value in ('0', 'false', 'no', 'off', 'disable', 'disabled'):
+        return False
+    error(f"{name} must be 1 or 0 (got {raw!r})")
+    sys.exit(1)
+
+
 def read_env():
     """Collect and validate the inputs from the environment."""
     ip_address = os.getenv('ASA_DT_IP')
@@ -172,6 +222,8 @@ def read_env():
     interface = os.getenv('ASA_DT_INTERFACE', DEFAULT_INTERFACE)
     nameif = os.getenv('ASA_DT_NAMEIF', DEFAULT_NAMEIF)
     object_name = os.getenv('ASA_DT_OBJECT', DEFAULT_OBJECT)
+    sensor_nameif = os.getenv('ASA_SENSOR_NAMEIF', DEFAULT_SENSOR_NAMEIF)
+    pat_group = os.getenv('ASA_PAT_GROUP', DEFAULT_PAT_GROUP)
 
     if not ip_address:
         error("ASA_DT_IP is not set. Export it before running, e.g.\n"
@@ -220,6 +272,14 @@ def read_env():
         # address, so it is derived from the network the new IP falls in.
         'subnet': str(network.network_address),
         'subnet_mask': str(network.netmask),
+        'sensor_nameif': sensor_nameif,
+        'pat_group': pat_group,
+        'pat_description': os.getenv(
+            'ASA_PAT_DESCRIPTION',
+            f"PAT all over egress behind {ip_address}"),
+        'siem': parse_toggle('ASA_SIEM'),
+        'agent': parse_toggle('ASA_AGENT'),
+        'pat': parse_toggle('ASA_PAT'),
     }
 
 
@@ -369,6 +429,167 @@ def apply_object(asa, settings):
     return 'failed'
 
 
+def nat_line(settings, spec):
+    """The object-NAT line, e.g. 'nat (SENSORPORT,DTOUT) static interface service tcp 9999 9997'."""
+    return (f"nat ({settings['sensor_nameif']},{settings['nameif']}) "
+            f"static interface service {spec['protocol']} "
+            f"{spec['real_port']} {spec['mapped_port']}")
+
+
+def pat_line(settings, with_description=True):
+    """
+    The global after-auto PAT rule. The description carries the DT address, so
+    it changes whenever ASA_DT_IP changes.
+    """
+    line = (f"nat ({settings['sensor_nameif']},{settings['nameif']}) after-auto "
+            f"source dynamic {settings['pat_group']} interface")
+    if with_description:
+        line += f" description {settings['pat_description']}"
+    return line
+
+
+def build_nat_object_commands(settings, spec, enable):
+    """Config commands to add or remove one object NAT rule."""
+    if enable:
+        commands = [f"object network {spec['object']}"]
+        host = os.getenv(spec['host_env'])
+        if host:
+            commands.append(f" host {host}")
+        commands.append(f" {nat_line(settings, spec)}")
+        return commands
+    # Remove the NAT only. The object itself is left in place because ACLs and
+    # other rules may still reference it; deleting it would break them.
+    return [f"object network {spec['object']}", " no nat"]
+
+
+def build_pat_commands(settings, enable):
+    """Config commands to add or remove the global after-auto PAT rule."""
+    if enable:
+        return [pat_line(settings)]
+    # Removal matches on the rule itself; the description is not part of the match.
+    return [f"no {pat_line(settings, with_description=False)}"]
+
+
+def object_nat_line(config_block):
+    """Pull the 'nat (...)' line out of a running-config object block."""
+    match = re.search(r'^\s*(nat \(.*)$', config_block or '', re.MULTILINE)
+    return match.group(1).strip() if match else None
+
+
+def show_nat(asa):
+    """Return the global NAT section of the running config."""
+    return asa.send_command('show running-config nat', timeout=15)
+
+
+def find_pat_rule(nat_config, settings):
+    """Return the existing after-auto PAT line for our group, if any."""
+    pattern = (rf'^\s*(nat \({re.escape(settings["sensor_nameif"])},'
+               rf'{re.escape(settings["nameif"])}\) after-auto source dynamic '
+               rf'{re.escape(settings["pat_group"])}\b.*)$')
+    match = re.search(pattern, nat_config or '', re.MULTILINE)
+    return match.group(1).strip() if match else None
+
+
+def apply_nat_object(asa, settings, spec, enable):
+    """
+    Add or remove one object NAT rule. Returns 'changed', 'unchanged' or 'failed'.
+    """
+    name = spec['object']
+    before = show_object(asa, name)
+    existing = object_nat_line(before)
+    wanted = nat_line(settings, spec)
+
+    if enable:
+        if existing == wanted:
+            info(f"{name}: NAT already correct — skipping.")
+            return 'unchanged'
+
+        # Object NAT needs an address on the object; the ASA rejects the nat
+        # line otherwise. Only the host env var can supply one we don't have.
+        if not object_body_type(before) and not os.getenv(spec['host_env']):
+            error(f"object network {name} does not exist or has no address. "
+                  f"Set {spec['host_env']} to its host IP, or create the object "
+                  f"first — the ASA will reject the NAT line without one.")
+            return 'failed'
+
+        if existing:
+            info(f"{name}: replacing {existing}")
+        else:
+            info(f"{name}: adding NAT rule")
+    else:
+        if not existing:
+            info(f"{name}: no NAT rule present — nothing to delete.")
+            return 'unchanged'
+        info(f"{name}: removing {existing}")
+
+    output = asa.send_config_commands(
+        build_nat_object_commands(settings, spec, enable),
+        description=f"{'Configure' if enable else 'Delete'} NAT on {name}"
+    )
+    if output is None:
+        error(f"Failed to send NAT commands for {name}")
+        return 'failed'
+
+    applied = object_nat_line(show_object(asa, name))
+    if enable and applied == wanted:
+        success(f"{name}: {wanted}")
+        return 'changed'
+    if not enable and not applied:
+        success(f"{name}: NAT rule removed")
+        return 'changed'
+
+    error(f"{name}: verification failed — device reports {applied!r}")
+    return 'failed'
+
+
+def apply_pat(asa, settings, enable):
+    """
+    Add or remove the global after-auto PAT rule. Returns 'changed',
+    'unchanged' or 'failed'.
+    """
+    group = settings['pat_group']
+    existing = find_pat_rule(show_nat(asa), settings)
+    wanted = pat_line(settings)
+
+    if enable:
+        if existing == wanted:
+            info(f"PAT: rule already correct — skipping.")
+            return 'unchanged'
+        if existing:
+            # An address change rewrites the description, so the old rule has
+            # to go first — the ASA will not merge two after-auto rules.
+            info(f"PAT: replacing {existing}")
+            asa.send_config_commands(build_pat_commands(settings, False),
+                                     description="Remove stale PAT rule")
+        else:
+            info(f"PAT: adding rule for {group}")
+    else:
+        if not existing:
+            info("PAT: no rule present — nothing to delete.")
+            return 'unchanged'
+        info(f"PAT: removing {existing}")
+
+    output = asa.send_config_commands(
+        build_pat_commands(settings, enable),
+        description=f"{'Configure' if enable else 'Delete'} PAT for {group}"
+    )
+    if output is None:
+        error("Failed to send PAT commands")
+        return 'failed'
+
+    applied = find_pat_rule(show_nat(asa), settings)
+    if enable and applied == wanted:
+        success(f"PAT: {wanted}")
+        return 'changed'
+    if not enable and not applied:
+        success("PAT: rule removed")
+        return 'changed'
+
+    error(f"PAT: verification failed — device reports {applied!r}")
+    return 'failed'
+
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Change the IP address on the ASA DT interface (Ethernet1/9) "
@@ -392,6 +613,11 @@ def main():
     settings = read_env()
     do_interface = not args.object_only
     do_object = not args.skip_object
+    # Each NAT feature runs only when its variable is set. Unset means leave it.
+    nat_specs = [(spec, settings[spec['env'].replace('ASA_', '').lower()])
+                 for spec in NAT_OBJECTS]
+    nat_specs = [(spec, want) for spec, want in nat_specs if want is not None]
+    do_pat = settings['pat'] is not None
 
     print(f"\n{Colors.BOLD}DT address change{Colors.RESET}")
     if do_interface:
@@ -402,6 +628,12 @@ def main():
     if do_object:
         print(f"  Object    : {settings['object_name']}")
         print(f"  Subnet    : {settings['subnet']} {settings['subnet_mask']}")
+    for spec, want in nat_specs:
+        print(f"  {spec['env']:<10}: {'configure' if want else 'DELETE'} "
+              f"{spec['object']}")
+    if do_pat:
+        print(f"  ASA_PAT   : {'configure' if settings['pat'] else 'DELETE'} "
+              f"{settings['pat_group']} PAT")
 
     if args.dry_run:
         print(f"\n{Colors.CYAN}{Colors.BOLD}--- DRY RUN MODE ---{Colors.RESET}")
@@ -415,6 +647,16 @@ def main():
         if do_object:
             print("  configure terminal")
             for cmd in build_object_commands(settings):
+                print(f"  {cmd}")
+            print("  exit")
+        for spec, want in nat_specs:
+            print("  configure terminal")
+            for cmd in build_nat_object_commands(settings, spec, want):
+                print(f"  {cmd}")
+            print("  exit")
+        if do_pat:
+            print("  configure terminal")
+            for cmd in build_pat_commands(settings, settings['pat']):
                 print(f"  {cmd}")
             print("  exit")
         if not args.no_save:
@@ -462,8 +704,30 @@ def main():
                 return 1
             outcomes.append(result)
 
+        for spec, want in nat_specs:
+            if not enter_enable(asa, auth_secret):
+                return 1
+            result = apply_nat_object(asa, settings, spec, want)
+            if result == 'failed':
+                if 'changed' in outcomes:
+                    warn("Earlier changes are in the running config but this "
+                         "stage failed — review before saving.")
+                return 1
+            outcomes.append(result)
+
+        if do_pat:
+            if not enter_enable(asa, auth_secret):
+                return 1
+            result = apply_pat(asa, settings, settings['pat'])
+            if result == 'failed':
+                if 'changed' in outcomes:
+                    warn("Earlier changes are in the running config but the PAT "
+                         "stage failed — review before saving.")
+                return 1
+            outcomes.append(result)
+
         if 'changed' not in outcomes:
-            success("Everything already matches the requested address — nothing to do.")
+            success("Everything already matches the requested state — nothing to do.")
             return 0
 
         if args.no_save:
