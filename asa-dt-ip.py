@@ -2,8 +2,9 @@
 """
 asa_set_dt_ip.py — change the IP address on the DT interface (Ethernet1/9).
 
-Reuses the serial console connection from asa_config_vpn.py (CiscoASA class),
-so the same auth / factory-wizard / enable-mode handling applies.
+Reuses the serial console connection from asa-config-vpn.py (CiscoASA class),
+so the same auth / factory-wizard / enable-mode handling applies. That file must
+sit in the same directory as this one.
 
 Environment variables:
   ASA_DT_IP         (required)  New IP address,        e.g. 192.168.20.30
@@ -22,13 +23,49 @@ Usage:
 """
 
 import argparse
+import importlib.util
 import ipaddress
 import logging
 import os
 import re
 import sys
 
-from asa_config_vpn import CiscoASA, Colors, success, error, warn
+# The VPN script is named with hyphens (asa-config-vpn.py), which is not a legal
+# Python module name, so 'import asa_config_vpn' cannot reach it. Load it by
+# file path from this script's own directory instead. The underscore spelling is
+# kept as a fallback so the script keeps working if the file is renamed back.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_VPN_CANDIDATES = ['asa-config-vpn.py', 'asa_config_vpn.py']
+
+
+def _load_vpn_module():
+    for filename in _VPN_CANDIDATES:
+        path = os.path.join(_SCRIPT_DIR, filename)
+        if not os.path.exists(path):
+            continue
+        spec = importlib.util.spec_from_file_location('asa_config_vpn', path)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        # Register before exec so anything inside that looks itself up by name
+        # (pickle, dataclasses, logging config) resolves correctly.
+        sys.modules['asa_config_vpn'] = module
+        spec.loader.exec_module(module)
+        return module
+
+    print(f"[ ERROR ] Could not find any of {', '.join(_VPN_CANDIDATES)} in "
+          f"{_SCRIPT_DIR}. Keep this script in the same directory as the "
+          f"ASA VPN script.")
+    sys.exit(1)
+
+
+_vpn = _load_vpn_module()
+
+CiscoASA = _vpn.CiscoASA
+Colors = _vpn.Colors
+success = _vpn.success
+error = _vpn.error
+warn = _vpn.warn
 
 DEFAULT_INTERFACE = 'Ethernet1/9'
 DEFAULT_NAMEIF = 'DTOUT'
@@ -157,7 +194,7 @@ def main():
         if 'nameif' not in before:
             warn(f"{settings['interface']} has no nameif configured — the ASA will "
                  f"reject 'ip address' until one is set. Run the full "
-                 f"asa_config_vpn.py first.")
+                 f"asa-config-vpn.py first.")
             return 1
 
         existing = current_ip(before)
