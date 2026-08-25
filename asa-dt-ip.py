@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-asa_set_dt_ip.py — change the IP address on the DT interface (Ethernet1/9).
+asa_set_dt_ip.py — change the IP address on the DT interface (Ethernet1/9)
+and keep the matching 'object network DTIP' subnet in step with it.
 
 Reuses the serial console connection from asa-config-vpn.py (CiscoASA class),
 so the same auth / factory-wizard / enable-mode handling applies. That file must
@@ -11,15 +12,21 @@ Environment variables:
   ASA_DT_NETMASK    (optional)  Dotted-decimal mask,   default 255.255.255.0
   ASA_DT_INTERFACE  (optional)  Hardware interface,    default Ethernet1/9
   ASA_DT_NAMEIF     (optional)  Expected nameif,       default DTOUT
+  ASA_DT_OBJECT     (optional)  Network object name,   default DTIP
   ASA_KNOWN_SECRET  (optional)  Enable password,       default Cisco123
   ASA_SECRET        (optional)  Overrides ASA_KNOWN_SECRET for auth
+
+The object subnet is derived from ASA_DT_IP + ASA_DT_NETMASK — e.g.
+192.168.20.45/255.255.255.0 gives 'subnet 192.168.20.0 255.255.255.0'.
 
 Usage:
   export ASA_DT_IP=192.168.20.45
   export ASA_DT_NETMASK=255.255.255.0
-  ./asa_set_dt_ip.py                 # apply and save
+  ./asa_set_dt_ip.py                 # apply both and save
   ./asa_set_dt_ip.py --dry-run       # print commands only, no serial connection
   ./asa_set_dt_ip.py --no-save       # apply but do not 'write memory'
+  ./asa_set_dt_ip.py --skip-object   # interface only, leave the object alone
+  ./asa_set_dt_ip.py --object-only   # object only, leave the interface alone
 """
 
 import argparse
@@ -70,6 +77,7 @@ warn = _vpn.warn
 DEFAULT_INTERFACE = 'Ethernet1/9'
 DEFAULT_NAMEIF = 'DTOUT'
 DEFAULT_NETMASK = '255.255.255.0'
+DEFAULT_OBJECT = 'DTIP'
 
 
 def info(msg):
@@ -82,6 +90,7 @@ def read_env():
     netmask = os.getenv('ASA_DT_NETMASK', DEFAULT_NETMASK)
     interface = os.getenv('ASA_DT_INTERFACE', DEFAULT_INTERFACE)
     nameif = os.getenv('ASA_DT_NAMEIF', DEFAULT_NAMEIF)
+    object_name = os.getenv('ASA_DT_OBJECT', DEFAULT_OBJECT)
 
     if not ip_address:
         error("ASA_DT_IP is not set. Export it before running, e.g.\n"
@@ -115,20 +124,43 @@ def read_env():
         error(f"ASA_DT_INTERFACE does not look like a hardware interface: {interface}")
         sys.exit(1)
 
+    if not re.match(r'^[A-Za-z0-9_.\-]{1,64}$', object_name):
+        error(f"ASA_DT_OBJECT is not a valid object name: {object_name}")
+        sys.exit(1)
+
     return {
         'ip_address': ip_address,
         'netmask': netmask,
         'interface': interface,
         'nameif': nameif,
         'network': str(network),
+        'object_name': object_name,
+        # The object holds the SUBNET the DT address sits in, not the host
+        # address, so it is derived from the network the new IP falls in.
+        'subnet': str(network.network_address),
+        'subnet_mask': str(network.netmask),
     }
 
 
-def build_commands(settings):
-    """The config-mode commands that change the address. Nothing else is touched."""
+def build_interface_commands(settings):
+    """Config-mode commands that change the interface address. Nothing else."""
     return [
         f"interface {settings['interface']}",
         f" ip address {settings['ip_address']} {settings['netmask']}",
+    ]
+
+
+def build_object_commands(settings):
+    """
+    Config-mode commands that repoint the network object at the new subnet.
+
+    Re-issuing 'subnet' inside an existing object network overwrites the
+    previous value, so no 'no subnet' is needed. Any NAT or ACL rule that
+    references the object picks up the new value automatically.
+    """
+    return [
+        f"object network {settings['object_name']}",
+        f" subnet {settings['subnet']} {settings['subnet_mask']}",
     ]
 
 
@@ -143,9 +175,123 @@ def current_ip(config_block):
     return (match.group(1), match.group(2)) if match else None
 
 
+def show_object(asa, object_name):
+    """Return the running-config block for the network object."""
+    return asa.send_command(f'show running-config object id {object_name}', timeout=10)
+
+
+def current_subnet(config_block):
+    """Pull 'subnet A B' out of a running-config object block."""
+    match = re.search(r'^\s*subnet (\S+) (\S+)', config_block or '', re.MULTILINE)
+    return (match.group(1), match.group(2)) if match else None
+
+
+def object_body_type(config_block):
+    """
+    Report what the object currently holds: 'subnet', 'host', 'range', 'fqdn'
+    or None. Overwriting a host object with a subnet is legal on the ASA but
+    almost certainly means the wrong object name was passed in.
+    """
+    match = re.search(r'^\s*(subnet|host|range|fqdn)\b', config_block or '',
+                      re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def apply_interface(asa, settings):
+    """
+    Set the interface address. Returns 'changed', 'unchanged' or 'failed'.
+    """
+    target = (settings['ip_address'], settings['netmask'])
+    before = show_interface(asa, settings['interface'])
+
+    if not before or 'Invalid input' in before:
+        error(f"Could not read {settings['interface']} from the running config. "
+              f"Check the interface name.")
+        return 'failed'
+
+    if 'nameif' not in before:
+        error(f"{settings['interface']} has no nameif configured — the ASA will "
+              f"reject 'ip address' until one is set. Run the full "
+              f"asa-config-vpn.py first.")
+        return 'failed'
+
+    existing = current_ip(before)
+    if existing == target:
+        info(f"{settings['interface']} already has {target[0]} {target[1]} — skipping.")
+        return 'unchanged'
+
+    if existing:
+        info(f"{settings['interface']} currently {existing[0]} {existing[1]}")
+    else:
+        info(f"{settings['interface']} currently has no IP address configured.")
+
+    output = asa.send_config_commands(
+        build_interface_commands(settings),
+        description=f"Set {settings['interface']} to {settings['ip_address']}"
+    )
+    if output is None:
+        error("Failed to send interface commands")
+        return 'failed'
+
+    applied = current_ip(show_interface(asa, settings['interface']))
+    if applied == target:
+        success(f"{settings['interface']} now {applied[0]} {applied[1]}")
+        return 'changed'
+
+    error(f"Interface verification failed — device reports "
+          f"{' '.join(applied) if applied else 'no address'}")
+    return 'failed'
+
+
+def apply_object(asa, settings):
+    """
+    Point the network object at the subnet the new address sits in.
+    Returns 'changed', 'unchanged' or 'failed'.
+    """
+    name = settings['object_name']
+    target = (settings['subnet'], settings['subnet_mask'])
+    before = show_object(asa, name)
+
+    body = object_body_type(before)
+    if body and body != 'subnet':
+        error(f"object network {name} currently holds a '{body}' entry, not a "
+              f"subnet. Refusing to overwrite it — check ASA_DT_OBJECT.")
+        return 'failed'
+
+    existing = current_subnet(before)
+    if existing == target:
+        info(f"object network {name} already has {target[0]} {target[1]} — skipping.")
+        return 'unchanged'
+
+    if existing:
+        info(f"object network {name} currently {existing[0]} {existing[1]}")
+    else:
+        # No output at all means the object does not exist yet; the commands
+        # below create it, which is the right outcome either way.
+        info(f"object network {name} not found — it will be created.")
+
+    output = asa.send_config_commands(
+        build_object_commands(settings),
+        description=f"Set object network {name} to {target[0]} {target[1]}"
+    )
+    if output is None:
+        error("Failed to send object commands")
+        return 'failed'
+
+    applied = current_subnet(show_object(asa, name))
+    if applied == target:
+        success(f"object network {name} now {applied[0]} {applied[1]}")
+        return 'changed'
+
+    error(f"Object verification failed — device reports "
+          f"{' '.join(applied) if applied else 'no subnet'}")
+    return 'failed'
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Change the IP address on the ASA DT interface (Ethernet1/9)."
+        description="Change the IP address on the ASA DT interface (Ethernet1/9) "
+                    "and keep the matching network object subnet in step."
     )
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the commands without connecting to the device")
@@ -153,24 +299,43 @@ def main():
                         help="Apply the change but do not write to startup-config")
     parser.add_argument("--verbose", action="store_true",
                         help="Echo raw console output")
+
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--skip-object", action="store_true",
+                       help="Change the interface only, leave the network object alone")
+    scope.add_argument("--object-only", action="store_true",
+                       help="Change the network object only, leave the interface alone")
+
     args = parser.parse_args()
 
     settings = read_env()
-    commands = build_commands(settings)
+    do_interface = not args.object_only
+    do_object = not args.skip_object
 
-    print(f"\n{Colors.BOLD}DT interface address change{Colors.RESET}")
-    print(f"  Interface : {settings['interface']} (expected nameif {settings['nameif']})")
-    print(f"  New IP    : {settings['ip_address']} {settings['netmask']}  "
-          f"[{settings['network']}]")
+    print(f"\n{Colors.BOLD}DT address change{Colors.RESET}")
+    if do_interface:
+        print(f"  Interface : {settings['interface']} "
+              f"(expected nameif {settings['nameif']})")
+        print(f"  New IP    : {settings['ip_address']} {settings['netmask']}  "
+              f"[{settings['network']}]")
+    if do_object:
+        print(f"  Object    : {settings['object_name']}")
+        print(f"  Subnet    : {settings['subnet']} {settings['subnet_mask']}")
 
     if args.dry_run:
         print(f"\n{Colors.CYAN}{Colors.BOLD}--- DRY RUN MODE ---{Colors.RESET}")
         print("Commands to be sent:")
         print("-" * 40)
-        print("  configure terminal")
-        for cmd in commands:
-            print(f"  {cmd}")
-        print("  exit")
+        if do_interface:
+            print("  configure terminal")
+            for cmd in build_interface_commands(settings):
+                print(f"  {cmd}")
+            print("  exit")
+        if do_object:
+            print("  configure terminal")
+            for cmd in build_object_commands(settings):
+                print(f"  {cmd}")
+            print("  exit")
         if not args.no_save:
             print("  write memory")
         print("-" * 40)
@@ -184,64 +349,46 @@ def main():
             error("Failed to connect to ASA")
             return 1
 
-        before = show_interface(asa, settings['interface'])
+        outcomes = []
 
-        if not before or 'Invalid input' in before:
-            error(f"Could not read {settings['interface']} from the running config. "
-                  f"Check the interface name.")
-            return 1
+        if do_interface:
+            result = apply_interface(asa, settings)
+            if result == 'failed':
+                return 1
+            outcomes.append(result)
 
-        if 'nameif' not in before:
-            warn(f"{settings['interface']} has no nameif configured — the ASA will "
-                 f"reject 'ip address' until one is set. Run the full "
-                 f"asa-config-vpn.py first.")
-            return 1
+        if do_object:
+            # Run even when the interface was already correct — the object can
+            # be out of step on its own, e.g. after a partial earlier run.
+            result = apply_object(asa, settings)
+            if result == 'failed':
+                if 'changed' in outcomes:
+                    warn("The interface address WAS changed but the object was not. "
+                         "The running config is now inconsistent — fix the object "
+                         "before saving.")
+                return 1
+            outcomes.append(result)
 
-        existing = current_ip(before)
-        if existing:
-            info(f"Current address: {existing[0]} {existing[1]}")
-            if existing == (settings['ip_address'], settings['netmask']):
-                success("Interface already has the requested address — nothing to do.")
-                return 0
-        else:
-            info("Interface currently has no IP address configured.")
-
-        results = asa.send_config_commands(
-            commands,
-            description=f"Set {settings['interface']} to {settings['ip_address']}"
-        )
-
-        if results is None:
-            error("Failed to send configuration commands")
-            return 1
-
-        after = show_interface(asa, settings['interface'])
-        applied = current_ip(after)
-
-        if applied == (settings['ip_address'], settings['netmask']):
-            success(f"{settings['interface']} now has "
-                    f"{applied[0]} {applied[1]}")
-        else:
-            error(f"Verification failed — device reports "
-                  f"{applied if applied else 'no address'}")
-            return 1
+        if 'changed' not in outcomes:
+            success("Everything already matches the requested address — nothing to do.")
+            return 0
 
         if args.no_save:
-            warn("Change is in the running config only. It will be lost on reload "
-                 "(re-run without --no-save, or issue 'write memory' manually).")
+            warn("Changes are in the running config only. They will be lost on "
+                 "reload (re-run without --no-save, or issue 'write memory').")
         else:
             if asa.save_config():
                 success("Saved to startup-config")
             else:
-                warn("Address applied but the startup-config save failed — "
-                     "the change will not survive a reload.")
+                warn("Changes applied but the startup-config save failed — "
+                     "they will not survive a reload.")
                 return 1
 
         print(f"\n{Colors.GREEN}{Colors.BOLD}✓ COMPLETE{Colors.RESET}")
         return 0
 
     except KeyboardInterrupt:
-        warn("Cancelled by user — the interface may be partially configured.")
+        warn("Cancelled by user — the config may be partially applied.")
         return 130
     except Exception as e:
         error(f"Failed: {e}")
