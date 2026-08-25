@@ -36,6 +36,7 @@ import logging
 import os
 import re
 import sys
+import time
 
 # The VPN script is named with hyphens (asa-config-vpn.py), which is not a legal
 # Python module name, so 'import asa_config_vpn' cannot reach it. Load it by
@@ -82,6 +83,151 @@ DEFAULT_OBJECT = 'DTIP'
 
 def info(msg):
     print(f"{Colors.CYAN}[ INFO ]{Colors.RESET} {msg}")
+
+
+# ---------------------------------------------------------------------------
+# Session handling
+#
+# 'console timeout 2' logs the console session out after two minutes idle and
+# drops it from enable mode back to user EXEC ('hostname>'). Two consequences
+# the shared readers in asa-config-vpn.py do not survive:
+#
+#   1. The logout injects an UNSOLICITED '>' prompt into the receive buffer.
+#      _read_password_response() stops on any trailing [#>], so the read that
+#      should have caught 'Password:' returns on that stale prompt instead,
+#      the 'password' test fails, and enable is silently abandoned. Worse,
+#      _try_serial_connection() ignores the return value of
+#      _serial_enter_enable_mode(), so connect() still reports success and
+#      every later command is issued at '>' where it is rejected.
+#
+#   2. The logout resets terminal settings, so 'terminal pager 0' is undone
+#      and 'show running-config ...' starts paging on <--- More --->, which
+#      the readers wait out until they time out.
+#
+# The helpers below read with explicit expect-patterns instead of "any prompt",
+# and always drain stale input first, so a mid-run logout is detected and
+# recovered from rather than mistaken for the reply to the current command.
+# ---------------------------------------------------------------------------
+
+ENABLE_PROMPT_RE = re.compile(r'(?m)^[\w.\-]+(?:\([\w\-]+\))?#\s*$')
+USER_PROMPT_RE = re.compile(r'(?m)^[\w.\-]+>\s*$')
+PASSWORD_RE = re.compile(r'(?i)password:\s*$')
+USERNAME_RE = re.compile(r'(?i)username:\s*$')
+DENIED_RE = re.compile(r'(?i)(access denied|invalid password|bad password)')
+
+
+def drain(asa):
+    """Discard anything left in the receive buffer from a previous command."""
+    try:
+        if asa.serial_port and asa.serial_port.in_waiting:
+            asa.serial_port.reset_input_buffer()
+    except Exception as e:
+        logging.debug(f"Buffer drain failed: {e}")
+
+
+def write_line(asa, text):
+    asa.serial_port.write((text + '\r').encode('utf-8'))
+    asa.serial_port.flush()
+
+
+def read_for(asa, patterns, timeout=10):
+    """
+    Read until one of (name, compiled_pattern) matches. Returns (name, buffer),
+    or (None, buffer) on timeout. The buffer starts empty on every call, so a
+    match can only come from output produced after this call began.
+    """
+    buf = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if asa.serial_port.in_waiting:
+            buf += asa.serial_port.read(
+                asa.serial_port.in_waiting).decode('utf-8', errors='ignore')
+            if asa.verbose:
+                print(buf[-200:], end='', flush=True)
+            for name, pattern in patterns:
+                if pattern.search(buf):
+                    return name, buf
+        time.sleep(0.05)
+    return None, buf
+
+
+def ensure_enable(asa, secret):
+    """
+    Guarantee the session is at an enable ('#') prompt, re-authenticating if a
+    console timeout has dropped it back to '>'. Safe to call repeatedly.
+    """
+    drain(asa)
+    write_line(asa, '')
+
+    state, buf = read_for(
+        asa,
+        [('enable', ENABLE_PROMPT_RE), ('user', USER_PROMPT_RE),
+         ('password', PASSWORD_RE), ('username', USERNAME_RE)],
+        timeout=5
+    )
+
+    if state == 'enable':
+        return True
+
+    if state == 'username':
+        error("The console is behind AAA authentication (Username: prompt). "
+              "This script only handles the enable password — log in manually "
+              "or disable 'aaa authentication serial console'.")
+        return False
+
+    if state is None:
+        error(f"No prompt from the console within 5s. Last bytes: "
+              f"{buf.strip()[-80:]!r}")
+        return False
+
+    # At '>' (or straight at a Password: prompt after a logout).
+    if state == 'user':
+        info("Session is at the user EXEC prompt — re-entering enable mode.")
+        drain(asa)
+        write_line(asa, 'enable')
+        state, buf = read_for(
+            asa,
+            [('password', PASSWORD_RE), ('enable', ENABLE_PROMPT_RE)],
+            timeout=10
+        )
+        if state == 'enable':
+            restore_terminal(asa)
+            return True
+        if state is None:
+            error("No 'Password:' prompt after 'enable'.")
+            return False
+
+    write_line(asa, secret)
+    state, buf = read_for(
+        asa,
+        [('enable', ENABLE_PROMPT_RE), ('denied', DENIED_RE),
+         ('password', PASSWORD_RE), ('user', USER_PROMPT_RE)],
+        timeout=10
+    )
+
+    if state == 'enable':
+        success("Re-entered enable mode.")
+        restore_terminal(asa)
+        return True
+
+    error("Enable authentication failed — check ASA_SECRET / ASA_KNOWN_SECRET.")
+    return False
+
+
+def restore_terminal(asa):
+    """Re-apply pager/width, which a console logout resets."""
+    for cmd in ('terminal pager 0', 'terminal width 200'):
+        drain(asa)
+        write_line(asa, cmd)
+        read_for(asa, [('enable', ENABLE_PROMPT_RE)], timeout=5)
+
+
+def console_timeout_value(asa):
+    """Return the configured 'console timeout' in minutes, or None."""
+    output = asa.send_command('show running-config | include console timeout',
+                              timeout=10)
+    match = re.search(r'console timeout (\d+)', output or '')
+    return int(match.group(1)) if match else None
 
 
 def read_env():
@@ -349,9 +495,24 @@ def main():
             error("Failed to connect to ASA")
             return 1
 
+        # connect() reports success even when enable-mode entry failed, so
+        # confirm the '#' prompt ourselves before touching the config.
+        auth_secret = (os.getenv('ASA_SECRET')
+                       or os.getenv('ASA_KNOWN_SECRET', 'Cisco123'))
+        if not ensure_enable(asa, auth_secret):
+            return 1
+
+        timeout_mins = console_timeout_value(asa)
+        if timeout_mins is not None and timeout_mins != 0:
+            info(f"Device has 'console timeout {timeout_mins}' — the session will "
+                 f"log out after {timeout_mins} min idle. Each stage re-checks "
+                 f"the prompt.")
+
         outcomes = []
 
         if do_interface:
+            if not ensure_enable(asa, auth_secret):
+                return 1
             result = apply_interface(asa, settings)
             if result == 'failed':
                 return 1
@@ -360,6 +521,8 @@ def main():
         if do_object:
             # Run even when the interface was already correct — the object can
             # be out of step on its own, e.g. after a partial earlier run.
+            if not ensure_enable(asa, auth_secret):
+                return 1
             result = apply_object(asa, settings)
             if result == 'failed':
                 if 'changed' in outcomes:
@@ -377,6 +540,10 @@ def main():
             warn("Changes are in the running config only. They will be lost on "
                  "reload (re-run without --no-save, or issue 'write memory').")
         else:
+            if not ensure_enable(asa, auth_secret):
+                error("Lost the enable prompt before saving — changes are in the "
+                      "running config only.")
+                return 1
             if asa.save_config():
                 success("Saved to startup-config")
             else:
