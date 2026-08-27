@@ -33,6 +33,22 @@ made from the device's running config, not just the flags given, so features
 you did not name are still counted. Suppress with --no-auto-shutdown. A run
 with no feature flags at all never touches the admin state.
 
+Every successful run ends with a machine-readable block reporting the state
+read back from the device — not just what this run changed — for loading into
+a database:
+
+  IP ADDRESS 192.168.20.45 255.255.255.0
+  SIEM true
+  AGENT false
+  PAT true
+  LINDEF true
+  WINDEF false
+  SHUTDOWN false
+
+A feature is true only when complete: SIEM needs its NAT and its ACL entry,
+AGENT needs those plus egress group membership, WINDEF needs all four objects.
+Use --status-json for the same thing as a single JSON object.
+
 Usage:
   export ASA_SECRET=...
   ./asa_set_dt_ip.py --ip 192.168.20.45 --siem enable --agent enable --pat enable
@@ -43,6 +59,7 @@ Usage:
 import argparse
 import importlib.util
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -271,6 +288,8 @@ def parse_args(argv=None):
                         help="Apply changes but do not write to startup-config")
     parser.add_argument("--verbose", action="store_true",
                         help="Echo raw console output")
+    parser.add_argument("--status-json", action="store_true",
+                        help="Emit the closing status block as JSON")
 
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument("--skip-object", action="store_true",
@@ -1019,6 +1038,76 @@ def apply_interface_state(asa, settings):
 
 
 
+def final_status(asa, settings):
+    """
+    Read back the state of every managed item after the run.
+
+    This is deliberately read from the device rather than assembled from the
+    flags: it reports what is actually on the box, including features this run
+    did not touch, which is what a database row should record.
+
+    A feature counts as true only when it is COMPLETE — SIEM needs both its NAT
+    and its ACL entry, AGENT needs those plus group membership, WINDEF needs
+    all four objects. A half-configured feature reports false.
+    """
+    nat_config = show_nat(asa)
+    acl_config = show_acl(asa, settings['acl_name'])
+    members = group_members(
+        object_block(asa.send_command('show running-config object-group', timeout=20),
+                     settings['pat_group'], keyword='object-group network'))
+    interface_block = show_interface(asa, settings['interface'])
+    address = current_ip(interface_block)
+
+    status = {
+        'ip': address[0] if address else None,
+        'netmask': address[1] if address else None,
+        'shutdown': interface_is_shutdown(interface_block),
+    }
+
+    for spec in NAT_OBJECTS:
+        name = spec['object']
+        complete = [
+            object_nat_rule(asa, name, nat_config) is not None,
+            find_acl_entry(acl_config, settings, spec) is not None,
+        ]
+        if spec.get('egress'):
+            complete.append(name in members)
+        status[spec['key']] = all(complete)
+
+    for spec in EGRESS_MEMBERS:
+        status[spec['key']] = all(n in members for n in spec['objects'])
+
+    status['pat'] = find_pat_rule(nat_config, settings) is not None
+    return status
+
+
+def emit_status(status, as_json=False):
+    """
+    Machine-readable summary, for feeding a database. Plain output is one
+    KEY VALUE pair per line with lowercase true/false, so it splits on the
+    first space.
+    """
+    if as_json:
+        print(json.dumps(status))
+        return
+
+    def flag(value):
+        return 'true' if value else 'false'
+
+    address = (f"{status['ip']} {status['netmask']}"
+               if status['ip'] else 'none none')
+
+    print()
+    print(f"IP ADDRESS {address}")
+    print(f"SIEM {flag(status['siem'])}")
+    print(f"AGENT {flag(status['agent'])}")
+    print(f"PAT {flag(status['pat'])}")
+    print(f"LINDEF {flag(status['lindef'])}")
+    print(f"WINDEF {flag(status['windef'])}")
+    print(f"SHUTDOWN {flag(status['shutdown'])}")
+
+
+
 def main():
     args = parse_args()
     settings = build_settings(args)
@@ -1232,6 +1321,7 @@ def main():
 
         if 'changed' not in outcomes:
             success("Everything already matches the requested state — nothing to do.")
+            emit_status(final_status(asa, settings), args.status_json)
             return 0
 
         if args.no_save:
@@ -1250,6 +1340,7 @@ def main():
                 return 1
 
         print(f"\n{Colors.GREEN}{Colors.BOLD}✓ COMPLETE{Colors.RESET}")
+        emit_status(final_status(asa, settings), args.status_json)
         return 0
 
     except KeyboardInterrupt:
