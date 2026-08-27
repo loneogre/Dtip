@@ -17,7 +17,13 @@ in the environment: ASA_SECRET (or ASA_KNOWN_SECRET, default Cisco123).
   --siem  enable|disable   SIEM-VM  NAT + ACL entry
   --agent enable|disable   AGENT-VM NAT + ACL entry
   --pat   enable|disable   Global after-auto PAT rule
+  --lindef enable|disable  LINDEF-VM in the egress group (no NAT, no ACL)
+  --windef enable|disable  WINDEF1-4 in the egress group (no NAT, no ACL)
   --siem-host / --agent-host   Host IP, only needed when creating the object
+
+--agent also adds or removes AGENT-VM in the egress object-group. --siem does
+not. --lindef and --windef only touch group membership — the objects ride the
+PAT rule out and have no NAT or ACL entry of their own.
 
 Omitting a feature flag leaves that feature exactly as it is on the device.
 
@@ -88,6 +94,14 @@ DEFAULT_SENSOR_NAMEIF = 'SENSORPORT'
 DEFAULT_ACL = 'DTOUT_IN'
 DEFAULT_PAT_GROUP = 'OVN-EGRESS'
 
+# Objects that are only ever members of the egress object-group — no NAT and no
+# ACL entry of their own, they just ride the PAT rule out.
+EGRESS_MEMBERS = [
+    {'key': 'lindef', 'flag': '--lindef', 'objects': ['LINDEF-VM']},
+    {'key': 'windef', 'flag': '--windef',
+     'objects': ['WINDEF1', 'WINDEF2', 'WINDEF3', 'WINDEF4']},
+]
+
 # The three optional NAT features, driven by ASA_SIEM / ASA_AGENT / ASA_PAT.
 # 1 = configure, 0 = delete, unset = leave exactly as it is.
 NAT_OBJECTS = [
@@ -107,6 +121,7 @@ NAT_OBJECTS = [
         'host_key': 'agent_host',
         'host_flag': '--agent-host',
         'object': 'AGENT-VM',
+        'egress': True,
         'protocol': 'tcp',
         'real_port': '8000',
         'mapped_port': '8000',
@@ -232,6 +247,12 @@ def parse_args(argv=None):
                           help="AGENT-VM NAT + ACL entry")
     features.add_argument("--pat", choices=toggle,
                           help="Global after-auto PAT rule")
+    features.add_argument("--lindef", choices=toggle,
+                          help="LINDEF-VM membership of the egress group "
+                               "(no NAT, no ACL)")
+    features.add_argument("--windef", choices=toggle,
+                          help="WINDEF1-4 membership of the egress group "
+                               "(no NAT, no ACL)")
     features.add_argument("--siem-host", metavar="ADDR",
                           help="Host IP, only needed when creating SIEM-VM")
     features.add_argument("--agent-host", metavar="ADDR",
@@ -323,6 +344,8 @@ def build_settings(args):
         'pat_description': (args.pat_description
                             or f"PAT all over egress behind {args.ip}"),
         'siem': want(args.siem),
+        'lindef': want(args.lindef),
+        'windef': want(args.windef),
         'agent': want(args.agent),
         'pat': want(args.pat),
         'siem_host': args.siem_host,
@@ -363,15 +386,16 @@ def current_ip(config_block):
     return (match.group(1), match.group(2)) if match else None
 
 
-def object_block(config_text, object_name):
+def object_block(config_text, object_name, keyword='object network'):
     """
     Slice one object's block out of a running-config dump, including anything
     indented under it — the 'host' line AND the nested 'nat (...)' line.
 
     Object NAT lives inside the object block, not in the global NAT section, so
-    this is what has to be parsed to see a SIEM-VM / AGENT-VM NAT rule.
+    this is what has to be parsed to see a SIEM-VM / AGENT-VM NAT rule. Pass
+    keyword='object-group network' to slice a group's member list instead.
     """
-    header = re.compile(rf'^object network {re.escape(object_name)}\s*$')
+    header = re.compile(rf'^{re.escape(keyword)} {re.escape(object_name)}\s*$')
     captured = []
     capturing = False
 
@@ -820,6 +844,94 @@ def apply_pat(asa, settings, enable):
 
 
 
+def show_object_group(asa, group_name):
+    """Return the running-config block for one object-group."""
+    output = asa.send_command('show running-config object-group', timeout=20)
+    block = object_block(output, group_name, keyword='object-group network')
+    if block:
+        return block
+    output = asa.send_command(f'show running-config object-group id {group_name}',
+                              timeout=10)
+    return object_block(output, group_name, keyword='object-group network')
+
+
+def group_members(group_block):
+    """The object names listed as 'network-object object NAME' in a group."""
+    return set(re.findall(r'^\s*network-object object (\S+)\s*$',
+                          group_block or '', re.MULTILINE))
+
+
+def build_group_commands(settings, names, enable):
+    """Config commands to add or remove members of the egress object-group."""
+    commands = [f"object-group network {settings['pat_group']}"]
+    prefix = '' if enable else 'no '
+    commands += [f" {prefix}network-object object {name}" for name in names]
+    return commands
+
+
+def apply_egress_members(asa, settings, label, names, enable):
+    """
+    Add or remove object-group members. Returns 'changed', 'unchanged'
+    or 'failed'.
+    """
+    group = settings['pat_group']
+    block = show_object_group(asa, group)
+
+    if not block:
+        error(f"object-group network {group} was not found. Create it first — "
+              f"this script will not create the group itself.")
+        return 'failed'
+
+    present = group_members(block)
+    if enable:
+        todo = [n for n in names if n not in present]
+        if not todo:
+            info(f"{group}: {label} already a member — skipping.")
+            return 'unchanged'
+
+        # The ASA rejects 'network-object object X' when X does not exist.
+        defined = show_object_network_names(asa)
+        missing = [n for n in todo if n not in defined]
+        if missing:
+            error(f"These objects do not exist, so they cannot be added to "
+                  f"{group}: {', '.join(missing)}. Create them first.")
+            return 'failed'
+
+        info(f"{group}: adding {', '.join(todo)}")
+    else:
+        todo = [n for n in names if n in present]
+        if not todo:
+            info(f"{group}: {label} not a member — nothing to delete.")
+            return 'unchanged'
+        info(f"{group}: removing {', '.join(todo)}")
+
+    output = asa.send_config_commands(
+        build_group_commands(settings, todo, enable),
+        description=f"{'Add' if enable else 'Remove'} {label} in {group}"
+    )
+    if output is None:
+        error(f"Failed to send object-group commands for {label}")
+        return 'failed'
+
+    after = group_members(show_object_group(asa, group))
+    if enable and all(n in after for n in names):
+        success(f"{group}: {', '.join(names)} present")
+        return 'changed'
+    if not enable and not any(n in after for n in names):
+        success(f"{group}: {', '.join(names)} removed")
+        return 'changed'
+
+    error(f"{group}: verification failed — members now {sorted(after)}")
+    return 'failed'
+
+
+def show_object_network_names(asa):
+    """Every object network name defined on the device."""
+    output = asa.send_command('show running-config object network', timeout=20)
+    return set(re.findall(r'^object network (\S+)\s*$', output or '', re.MULTILINE))
+
+
+
 def feature_state_on_device(asa, settings):
     """
     Read back which of the three features are actually present on the device.
@@ -901,6 +1013,8 @@ def main():
     # A feature runs only when its flag was given; omitted means leave it alone.
     nat_specs = [(spec, settings[spec['key']]) for spec in NAT_OBJECTS
                  if settings[spec['key']] is not None]
+    egress_specs = [(spec, settings[spec['key']]) for spec in EGRESS_MEMBERS
+                    if settings[spec['key']] is not None]
     do_pat = settings['pat'] is not None
     # Only touch the admin state when the run actually decided something about
     # the features — a bare address change should not shut the port.
@@ -918,6 +1032,9 @@ def main():
     for spec, want in nat_specs:
         print(f"  {spec['flag']:<8}  : {'enable' if want else 'DISABLE'} "
               f"{spec['object']} (NAT + {settings['acl_name']} ACE)")
+    for spec, want in egress_specs:
+        print(f"  {spec['flag']:<8}  : {'enable' if want else 'DISABLE'} "
+              f"{', '.join(spec['objects'])} in {settings['pat_group']}")
     if do_pat:
         print(f"  --pat     : {'enable' if settings['pat'] else 'DISABLE'} "
               f"{settings['pat_group']} PAT")
@@ -944,6 +1061,14 @@ def main():
             for cmd in build_nat_object_commands(settings, spec, want):
                 print(f"  {cmd}")
             for cmd in build_acl_commands(settings, spec, want):
+                print(f"  {cmd}")
+            if spec.get('egress'):
+                for cmd in build_group_commands(settings, [spec['object']], want):
+                    print(f"  {cmd}")
+            print("  exit")
+        for spec, want in egress_specs:
+            print("  configure terminal")
+            for cmd in build_group_commands(settings, spec['objects'], want):
                 print(f"  {cmd}")
             print("  exit")
         if do_pat:
@@ -1024,6 +1149,25 @@ def main():
                 warn(f"The NAT for {spec['object']} is in place but its "
                      f"{settings['acl_name']} entry is not — traffic will be "
                      f"translated and then dropped. Fix before saving.")
+                return 1
+            outcomes.append(result)
+
+            if spec.get('egress'):
+                result = apply_egress_members(asa, settings, spec['object'],
+                                              [spec['object']], want)
+                if result == 'failed':
+                    return 1
+                outcomes.append(result)
+
+        for spec, want in egress_specs:
+            if not enter_enable(asa, auth_secret):
+                return 1
+            result = apply_egress_members(asa, settings, spec['flag'].lstrip('-'),
+                                          spec['objects'], want)
+            if result == 'failed':
+                if 'changed' in outcomes:
+                    warn("Earlier changes are in the running config but this "
+                         "stage failed — review before saving.")
                 return 1
             outcomes.append(result)
 
