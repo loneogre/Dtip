@@ -903,6 +903,21 @@ def apply_egress_members(asa, settings, label, names, enable):
         if not todo:
             info(f"{group}: {label} not a member — nothing to delete.")
             return 'unchanged'
+
+        # The ASA will not let the last member leave a group that an active NAT
+        # rule still points at — the rule would be left referencing nothing.
+        # The PAT rule has to go first, which is why a disable run removes it
+        # before touching membership.
+        if not (present - set(todo)):
+            blocking = find_pat_rule(show_nat(asa), settings)
+            if blocking:
+                error(f"Removing {', '.join(todo)} would leave {group} empty, and "
+                      f"the PAT rule still references it — the ASA rejects that. "
+                      f"Pass --pat disable in the same run, or leave one member "
+                      f"in place.")
+                return 'failed'
+            warn(f"{group} will be left with no members.")
+
         info(f"{group}: removing {', '.join(todo)}")
 
     output = asa.send_config_commands(
@@ -1056,6 +1071,12 @@ def main():
             for cmd in build_object_commands(settings):
                 print(f"  {cmd}")
             print("  exit")
+        pat_first = do_pat and not settings['pat']
+        if pat_first:
+            print("  configure terminal")
+            for cmd in build_pat_commands(settings, settings['pat']):
+                print(f"  {cmd}")
+            print("  exit")
         for spec, want in nat_specs:
             print("  configure terminal")
             for cmd in build_nat_object_commands(settings, spec, want):
@@ -1071,7 +1092,7 @@ def main():
             for cmd in build_group_commands(settings, spec['objects'], want):
                 print(f"  {cmd}")
             print("  exit")
-        if do_pat:
+        if do_pat and not pat_first:
             print("  configure terminal")
             for cmd in build_pat_commands(settings, settings['pat']):
                 print(f"  {cmd}")
@@ -1133,6 +1154,29 @@ def main():
                 return 1
             outcomes.append(result)
 
+        def run_pat_stage():
+            """Returns None to continue, or an exit code to abort with."""
+            if not enter_enable(asa, auth_secret):
+                return 1
+            result = apply_pat(asa, settings, settings['pat'])
+            if result == 'failed':
+                if 'changed' in outcomes:
+                    warn("Earlier changes are in the running config but the PAT "
+                         "stage failed — review before saving.")
+                return 1
+            outcomes.append(result)
+            return None
+
+        # A PAT rule pointing at the egress group blocks that group from being
+        # emptied, so on a disable run it has to come off first. On an enable
+        # run the members must exist before the rule that references them, so
+        # it goes last.
+        pat_first = do_pat and not settings['pat']
+        if pat_first:
+            failure = run_pat_stage()
+            if failure is not None:
+                return failure
+
         for spec, want in nat_specs:
             if not enter_enable(asa, auth_secret):
                 return 1
@@ -1171,16 +1215,10 @@ def main():
                 return 1
             outcomes.append(result)
 
-        if do_pat:
-            if not enter_enable(asa, auth_secret):
-                return 1
-            result = apply_pat(asa, settings, settings['pat'])
-            if result == 'failed':
-                if 'changed' in outcomes:
-                    warn("Earlier changes are in the running config but the PAT "
-                         "stage failed — review before saving.")
-                return 1
-            outcomes.append(result)
+        if do_pat and not pat_first:
+            failure = run_pat_stage()
+            if failure is not None:
+                return failure
 
         if do_admin_state:
             if not enter_enable(asa, auth_secret):
