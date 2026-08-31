@@ -27,6 +27,11 @@ PAT rule out and have no NAT or ACL entry of their own.
 
 Omitting a feature flag leaves that feature exactly as it is on the device.
 
+Disabling a feature removes its NAT and ACL, which only stops NEW connections
+— anything already in the conn table keeps flowing until it idles out. So a
+disable also clears the live connections and translations for the affected
+hosts with 'clear local-host'. Suppress with --no-clear-sessions.
+
 Admin state: once features have been applied, the interface is shut when none
 of the three are enabled and brought up when at least one is. The decision is
 made from the device's running config, not just the flags given, so features
@@ -279,6 +284,9 @@ def parse_args(argv=None):
     features.add_argument("--pat-description", metavar="TEXT",
                           help="Override the PAT rule description")
 
+    parser.add_argument("--no-clear-sessions", action="store_true",
+                        help="Do not tear down existing connections for features "
+                             "this run disables (they keep flowing until idle)")
     parser.add_argument("--no-auto-shutdown", action="store_true",
                         help="Do not shut/no-shut the interface based on whether "
                              "any feature is left enabled")
@@ -1100,6 +1108,79 @@ def apply_interface_state(asa, settings):
 
 
 
+def object_hosts(asa):
+    """Map every object network name to its host address, where it has one."""
+    output = asa.send_command('show running-config object network', timeout=20)
+    hosts = {}
+    current = None
+    for line in (output or '').splitlines():
+        header = re.match(r'^object network (\S+)\s*$', line)
+        if header:
+            current = header.group(1)
+            continue
+        host = re.match(r'^\s+host (\S+)\s*$', line)
+        if host and current:
+            hosts[current] = host.group(1)
+    return hosts
+
+
+def clear_sessions(asa, targets):
+    """
+    Tear down live connections and translations for the given hosts.
+
+    Removing a NAT rule or an ACE only stops NEW connections — anything already
+    in the conn table keeps flowing until it idles out, which can be hours. So
+    a disable is not actually in force until the existing sessions are cleared.
+
+    'clear local-host' drops both the connections and the xlates for one
+    address and nothing else, so other hosts are unaffected. These are exec
+    commands, not config, and they are not written to startup-config.
+    """
+    if not targets:
+        return []
+
+    cleared = []
+    for name, host in sorted(targets.items()):
+        info(f"Clearing live sessions for {name} ({host})")
+        output = asa.send_command(f'clear local-host {host}', timeout=15)
+        if output and re.search(r'(?m)^\s*(%|ERROR:)', output):
+            warn(f"Could not clear sessions for {host}: "
+                 f"{output.strip()[-120:]!r}. Existing streams may continue "
+                 f"until they idle out.")
+            continue
+        cleared.append(host)
+
+    if cleared:
+        success(f"Cleared existing connections and translations for "
+                f"{len(cleared)} host{'' if len(cleared) == 1 else 's'}.")
+    return cleared
+
+
+def disabled_targets(settings, nat_specs, egress_specs, hosts, group_members_before):
+    """
+    Work out whose sessions to clear, from what this run turned off.
+
+    Disabling PAT strands every member of the egress group, not just the ones
+    named on the command line, so the group's membership as it was BEFORE the
+    run is what counts.
+    """
+    names = set()
+
+    for spec, want in nat_specs:
+        if not want:
+            names.add(spec['object'])
+
+    for spec, want in egress_specs:
+        if not want:
+            names.update(spec['objects'])
+
+    if settings['pat'] is False:
+        names.update(group_members_before)
+
+    return {name: hosts[name] for name in sorted(names) if name in hosts}
+
+
+
 def final_status(asa, settings):
     """
     Read back the state of every managed item after the run.
@@ -1260,6 +1341,16 @@ def main():
                 print(f"  {Colors.YELLOW}(flags given all disable; on the device "
                       f"the decision also accounts for features not named "
                       f"here){Colors.RESET}")
+        if not args.no_clear_sessions:
+            stranded = [s['object'] for s in NAT_OBJECTS
+                        if settings[s['key']] is False]
+            for s in EGRESS_MEMBERS:
+                if settings[s['key']] is False:
+                    stranded += s['objects']
+            if settings['pat'] is False:
+                stranded.append(f"(all current members of {settings['pat_group']})")
+            for name in stranded:
+                print(f"  clear local-host <address of {name}>")
         if not args.no_save:
             print("  write memory")
         print("-" * 40)
@@ -1304,6 +1395,16 @@ def main():
                          "before saving.")
                 return 1
             outcomes.append(result)
+
+        # Snapshot before anything changes: once members are removed from the
+        # group there is no way to know whose sessions to clear.
+        clearing = not args.no_clear_sessions
+        hosts_before = object_hosts(asa) if clearing else {}
+        members_before = group_members(
+            object_block(asa.send_command('show running-config object-group',
+                                          timeout=20),
+                         settings['pat_group'],
+                         keyword='object-group network')) if clearing else set()
 
         def run_pat_stage():
             """Returns None to continue, or an exit code to abort with."""
@@ -1370,6 +1471,14 @@ def main():
             failure = run_pat_stage()
             if failure is not None:
                 return failure
+
+        if clearing:
+            targets = disabled_targets(settings, nat_specs, egress_specs,
+                                       hosts_before, members_before)
+            if targets:
+                if not enter_enable(asa, auth_secret):
+                    return 1
+                clear_sessions(asa, targets)
 
         if do_admin_state:
             if not enter_enable(asa, auth_secret):
