@@ -741,6 +741,38 @@ def normalise_ace(line):
     return re.sub(r'^(access-list \S+) line \d+ ', r'\1 ', line.strip())
 
 
+def acl_entries(acl_config, acl_name):
+    """
+    The ACL's entries in order, normalised. The 1-based index of an entry is
+    its ASA line number — remarks occupy line numbers too, so they are kept.
+    """
+    prefix = f'access-list {acl_name} '
+    return [normalise_ace(line.strip())
+            for line in (acl_config or '').splitlines()
+            if line.strip().startswith(prefix)]
+
+
+def first_deny_line(entries):
+    """
+    Line number of the first deny ACE, or None. Anything appended after a deny
+    is unreachable, which is why a new permit has to be inserted above it.
+
+    'deny' must follow the ACL name (optionally via 'extended'), so a remark
+    that happens to contain the word does not count.
+    """
+    for number, text in enumerate(entries, start=1):
+        if re.match(r'^access-list \S+ (?:extended )?deny\b', text):
+            return number
+    return None
+
+
+def acl_line_at(settings, spec, line_number):
+    """The ACE written as an insertion at a specific line number."""
+    base = acl_line(settings, spec)
+    return base.replace(f"access-list {settings['acl_name']} ",
+                        f"access-list {settings['acl_name']} line {line_number} ", 1)
+
+
 def find_acl_entry(acl_config, settings, spec):
     """
     Return the existing ACE referencing this object, as the device words it,
@@ -754,9 +786,17 @@ def find_acl_entry(acl_config, settings, spec):
     return normalise_ace(match.group(1)) if match else None
 
 
-def build_acl_commands(settings, spec, enable, existing=None):
-    """Config commands to add or remove the ACE for one object."""
+def build_acl_commands(settings, spec, enable, existing=None, line_number=None):
+    """
+    Config commands to add or remove the ACE for one object.
+
+    `line_number` inserts the ACE at that position instead of appending. That
+    matters when the ACL ends in an explicit deny: an appended permit sits
+    below it and never matches.
+    """
     if enable:
+        if line_number:
+            return [acl_line_at(settings, spec, line_number)]
         return [acl_line(settings, spec)]
     return [f"no {existing or acl_line(settings, spec)}"]
 
@@ -782,29 +822,51 @@ def apply_acl(asa, settings, spec, enable):
             info(f"{acl}: replacing {existing}")
             asa.send_config_commands(build_acl_commands(settings, spec, False, existing),
                                      description=f"Remove stale ACE for {name}")
+            # Removing an entry renumbers everything below it, so the insertion
+            # point has to be recalculated against the ACL as it is now.
+            config = show_acl(asa, acl)
         else:
             info(f"{acl}: adding ACE for {name}")
             if not config:
                 warn(f"{acl} does not exist yet — this ACE will create it. Make "
                      f"sure it is applied to the interface with "
                      f"'access-group {acl} in interface {settings['nameif']}'.")
+
+        # Append only when nothing would shadow the new entry.
+        line_number = first_deny_line(acl_entries(config, acl))
+        if line_number:
+            info(f"{acl}: inserting at line {line_number}, above the deny at that "
+                 f"position (appending would put it below and it would never "
+                 f"match).")
     else:
+        line_number = None
         if not existing:
             info(f"{acl}: no ACE for {name} — nothing to delete.")
             return 'unchanged'
         info(f"{acl}: removing {existing}")
 
     output = asa.send_config_commands(
-        build_acl_commands(settings, spec, enable, existing),
+        build_acl_commands(settings, spec, enable, existing,
+                           line_number if enable else None),
         description=f"{'Configure' if enable else 'Delete'} ACE for {name}"
     )
     if output is None:
         error(f"Failed to send ACL commands for {name}")
         return 'failed'
 
-    applied = find_acl_entry(show_acl(asa, acl), settings, spec)
+    after = show_acl(asa, acl)
+    applied = find_acl_entry(after, settings, spec)
     if enable and applied == wanted:
-        success(f"{acl}: {wanted}")
+        entries = acl_entries(after, acl)
+        deny_at = first_deny_line(entries)
+        position = next((n for n, text in enumerate(entries, start=1)
+                         if text == applied), None)
+        if deny_at and position and position > deny_at:
+            error(f"{acl}: the ACE landed at line {position}, below the deny at "
+                  f"line {deny_at} — it will never match.")
+            return 'failed'
+        success(f"{acl}: {wanted}"
+                + (f" (line {position})" if position else ""))
         return 'changed'
     if not enable and not applied:
         success(f"{acl}: ACE for {name} removed")
